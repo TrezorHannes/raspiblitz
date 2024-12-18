@@ -1,5 +1,7 @@
 #!/bin/bash
 
+source /home/admin/raspiblitz.info
+
 source <(/home/admin/_cache.sh get \
   state \
   setupPhase \
@@ -7,6 +9,8 @@ source <(/home/admin/_cache.sh get \
   chain \
   lightning \
   codeVersion \
+  codeRelease \
+  codeCommit \
   hostname \
   undervoltageReports \
   hdd_used_info \
@@ -19,6 +23,7 @@ source <(/home/admin/_cache.sh get \
   system_ups_status \
   system_ups_battery \
   system_cpu_load \
+  system_up_text \
   system_temp_celsius \
   system_temp_fahrenheit \
   runBehindTor \
@@ -311,7 +316,14 @@ if [ "${blitzapi}" == "on" ]; then
  webuiinfo="Web Admin --> http://${internet_localip}"
 fi
 
-datetime=$(date -R)
+datetime=$(date +"%d %b %T %z")
+datetime="${datetime} up ${system_up_text}"
+
+if [ "${vm}" == "1" ]; then
+    temp_info="VM detected"
+else
+    temp_info="temp ${system_temp_celsius}°C ${system_temp_fahrenheit}°F"
+fi
 
 stty sane
 sleep 1
@@ -325,7 +337,7 @@ ${color_yellow}               ${color_amber}%s ${color_green} ${ln_alias} ${upsI
 ${color_yellow}               ${color_gray}${network^} Fullnode${LNinfo} ${torInfo}
 ${color_yellow}        ,/     ${color_yellow}%s
 ${color_yellow}      ,'/      ${color_gray}%s
-${color_yellow}    ,' /       ${color_gray}%s, temp %s°C %s°F
+${color_yellow}    ,' /       ${color_gray}%s ${temp_info}
 ${color_yellow}  ,'  /_____   ${color_gray}Free Mem ${color_ram}${ram} ${color_gray} HDD ${color_hdd}%s${color_gray}
 ${color_yellow},'_____    ,'  ${color_gray}SSH admin@${internet_localip}${color_gray} d${internet_rx} u${internet_tx}
 ${color_yellow}      /  ,'    ${color_gray}${webuiinfo} 
@@ -337,10 +349,10 @@ ${color_yellow}               ${color_gray}${ln_channelInfo} ${ln_peersInfo}
 ${color_yellow}               ${color_gray}${ln_feeReport}
 $lastLine
 " \
-"RaspiBlitz v${codeVersion}" \
+"RaspiBlitz ${codeVersion}-${codeRelease}" \
 "-------------------------------------------" \
 "Refreshed: ${datetime}" \
-"CPU load${system_cpu_load##up*,  }" "${system_temp_celsius}" "${system_temp_fahrenheit}" \
+"CPU load${system_cpu_load##up*,  }" \
 "${hdd_used_info}" "${sync_percentage}"
 
 if [ ${#undervoltageReports} -gt 0 ] && [ "${undervoltageReports}" != "0" ]; then
@@ -353,11 +365,22 @@ else
   appInfoLine=""
 
   # Electrum Server - electrs
-  if [ "${ElectRS}" == "on" ]; then
+  fileFlagExists=$(sudo ls /mnt/hdd/app-storage/electrs/initial-sync.done 2>/dev/null | grep -c 'initial-sync.done')
+  if [ "${ElectRS}" == "on" ] && [ $fileFlagExists -eq 0 ]; then
     error=""
-    source <(sudo /home/admin/config.scripts/bonus.electrs.sh status-sync 2>/dev/null)
+    source <(/home/admin/config.scripts/bonus.electrs.sh status-sync 2>/dev/null)
     if [ ${#infoSync} -gt 0 ]; then
       appInfoLine="Electrum: ${infoSync}"
+    fi
+  fi
+
+  # Electrum Server - fulcrum
+  fileFlagExists=$(sudo ls /mnt/hdd/app-storage/fulcrum/initial-sync.done 2>/dev/null | grep -c 'initial-sync.done')
+  if [ "${fulcrum}" == "on" ] && [ $fileFlagExists -eq 0 ]; then
+    error=""
+    source <(/home/admin/config.scripts/bonus.fulcrum.sh status-sync 2>/dev/null)
+    if [ ${#infoSync} -gt 0 ]; then
+      appInfoLine="Fulcrum: ${infoSync}"
     fi
   fi
 

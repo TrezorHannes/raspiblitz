@@ -27,10 +27,11 @@ action=$1
 #########################
 # STATUS
 
-# gather data on sd card
+# gather data on SDcard / OS drive
 minimumSizeByte=16384000000
-rootPartition=$(sudo mount | grep " / " | cut -d " " -f 1 | cut -d "/" -f 3)
-rootPartitionBytes=$(lsblk -b -o NAME,SIZE | grep "${rootPartition}" | tr -s ' ' | cut -d " " -f 2)
+rootPartitionLine=$(sudo mount | grep " / " | cut -d " " -f 1)
+rootPartition=$(basename ${rootPartitionLine})
+rootPartitionBytes=$(lsblk -b -o NAME,SIZE | grep "${rootPartition}" | awk '{print $2}')
 
 # make conclusions
 needsExpansion=0
@@ -66,20 +67,10 @@ if [ "${action}" == "fsexpand" ]; then
         if [ -x ${resizeRaspbian} ]; then
             echo "# RUNNING EXPAND RASPBERRYPI: ${resizeRaspbian}"
 		    sudo $resizeRaspbian --expand-rootfs 1>&2
+            sudo touch /forcefsck
             echo "# DONE - please reboot"
 	    else
             echo "# FAIL to execute on ${baseimage}: ${resizeRaspbian}"
-            echo "err='expand failed'"
-            exit 1
-        fi
-    elif [ "${baseimage}" = "armbian" ]; then
-        resizeArmbian="/usr/lib/armbian/armbian-resize-filesystem"
-        if [ -x ${resizeArmbian} ]; then
-            echo "# RUNNING EXPAND ARMBIAN: ${resizeArmbian}"
-            sudo $resizeArmbian start 1>&2
-            echo "# DONE - please reboot"
-	    else
-            echo "# FAIL to execute on ${baseimage}: ${resizeArmbian}"
             echo "err='expand failed'"
             exit 1
         fi

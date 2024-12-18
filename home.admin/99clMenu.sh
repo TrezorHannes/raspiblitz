@@ -56,7 +56,7 @@ CHOICE=$(dialog --clear \
 case $CHOICE in
   SUMMARY)
       clear
-      /home/admin/config.scripts/cl-plugin.summary.sh $CHAIN
+      /home/admin/config.scripts/cl-plugin.summars.sh $CHAIN
       echo "Press ENTER to return to main menu."
       read key
       ;;
@@ -112,7 +112,11 @@ case $CHOICE in
       echo
       # setting value in the raspiblitz.conf
       /home/admin/config.scripts/blitz.conf.sh set lightning "cl"
-      sudo systemctl restart blitzapi 2>/dev/null
+      # when raspiblitz api is active - trigger a restart
+      if systemctl list-unit-files --type=service | grep -Fq 'blitzapi.service'; then
+        echo "# Restarting the blitzapi ..."
+        sudo systemctl restart blitzapi
+      fi
       echo "# OK - lightning=cl is set in /mnt/hdd/raspiblitz.conf"
       echo
       echo "Press ENTER to return to main menu."

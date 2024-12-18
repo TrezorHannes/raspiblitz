@@ -3,7 +3,7 @@
 # https://github.com/lnbits/lnbits
 
 # https://github.com/lnbits/lnbits/releases
-tag="0.11.3"
+tag="v0.12.11"
 VERSION="${tag}"
 
 # command info
@@ -29,13 +29,18 @@ fi
 echo "# Running: 'bonus.lnbits.sh $*'"
 source /mnt/hdd/raspiblitz.conf
 
+lnbitsDataDir="/mnt/hdd/app-data/LNBits/data"
+lnbitsConfig="${lnbitsDataDir}/.env"
+
 function postgresConfig() {
+
   sudo /home/admin/config.scripts/bonus.postgresql.sh on || exit 1
   echo "# Generate the database lnbits_db"
 
   # migrate clean up
   source <(/home/admin/_cache.sh get LNBitsMigrate)
   if [ "${LNBitsMigrate}" == "on" ]; then
+    echo "# LNBitsMigrate=on --> Cleaning old lnbits_db & lnbits_user"
     sudo -u postgres psql -c "drop database lnbits_db;"
     sudo -u postgres psql -c "drop user lnbits_user;"
   fi
@@ -99,11 +104,11 @@ function revertMigration() {
 
     # update config
     echo "# Configure config .env"
+    sudo sed -i "/^LNBITS_DATABASE_URL=/d" $lnbitsConfig
 
     # clean up
-    sudo sed -i "/^LNBITS_DATABASE_URL=/d" /home/lnbits/lnbits/.env
-    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" /home/lnbits/lnbits/.env
-    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits' >> /home/lnbits/lnbits/.env"
+    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" $lnbitsConfig
+    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits' >> ${lnbitsConfig}"
 
     # start service
     echo "# Start LNBits"
@@ -129,12 +134,12 @@ if [ "$1" = "menu" ]; then
   # display possible problems with IP2TOR setup
   if [ ${#ip2torWarn} -gt 0 ]; then
     whiptail --title " Warning " \
-    --yes-button "Back" \
-    --no-button "Continue Anyway" \
-    --yesno "Your IP2TOR+LetsEncrypt may have problems:\n${ip2torWarn}\n\nCheck if locally responding: https://${localIP}:${httpsPort}\n\nCheck if service is reachable over Tor:\n${toraddress}" 14 72
+      --yes-button "Back" \
+      --no-button "Continue Anyway" \
+      --yesno "Your IP2TOR+LetsEncrypt may have problems:\n${ip2torWarn}\n\nCheck if locally responding: https://${localIP}:${httpsPort}\n\nCheck if service is reachable over Tor:\n${toraddress}" 14 72
     if [ "$?" != "1" ]; then
       exit 0
-	  fi
+    fi
   fi
 
   # add info on funding source
@@ -148,7 +153,7 @@ if [ "$1" = "menu" ]; then
   text="https://${localIP}:${httpsPort}${authMethod}"
 
   if [ ${#publicDomain} -gt 0 ]; then
-     text="${text}
+    text="${text}
 Public Domain: https://${publicDomain}:${httpsPort}
 port forwarding on router needs to be active & may change port"
   fi
@@ -201,8 +206,6 @@ Consider adding a IP2TOR Bridge under OPTIONS."
     # just IP2TOR active - offer cancel or Lets Encrypt
     OPTIONS+=(HTTPS-ON "Add free HTTPS-Certificate for LNbits")
     OPTIONS+=(IP2TOR-OFF "Cancel IP2Tor Subscription for LNbits")
-  else
-    OPTIONS+=(IP2TOR-ON "Make Public with IP2Tor Subscription")
   fi
 
   # Change Funding Source options (only if available)
@@ -223,141 +226,168 @@ Consider adding a IP2TOR Bridge under OPTIONS."
     OPTIONS+=(MIGRATE-DB "Migrate SQLite to PostgreSQL database")
   fi
 
+  # Admin UI
+  activatedAdminUI=$(sudo grep -c "LNBITS_ADMIN_UI=true" $lnbitsConfig)
+  if [ ${activatedAdminUI} -eq 0 ]; then
+    OPTIONS+=(ADMINUI "Activate 'Admin UI'")
+  else
+    OPTIONS+=(ADMINUI "Deactivate 'Admin UI'")
+  fi
+
   WIDTH=66
   CHOICE_HEIGHT=$(("${#OPTIONS[@]}/2+1"))
-  HEIGHT=$((CHOICE_HEIGHT+7))
+  HEIGHT=$((CHOICE_HEIGHT + 7))
   CHOICE=$(dialog --clear \
-                --title " LNbits - Options" \
-                --ok-label "Select" \
-                --cancel-label "Back" \
-                --menu "Choose one of the following options:" \
-                $HEIGHT $WIDTH $CHOICE_HEIGHT \
-                "${OPTIONS[@]}" \
-                2>&1 >/dev/tty)
+    --title " LNbits - Options" \
+    --ok-label "Select" \
+    --cancel-label "Back" \
+    --menu "Choose one of the following options:" \
+    $HEIGHT $WIDTH $CHOICE_HEIGHT \
+    "${OPTIONS[@]}" \
+    2>&1 >/dev/tty)
 
   case $CHOICE in
-        IP2TOR-ON)
-            python /home/admin/config.scripts/blitz.subscriptions.ip2tor.py create-ssh-dialog LNBITS ${toraddress} 443
-            exit 0
-            ;;
-        IP2TOR-OFF)
-            clear
-            python /home/admin/config.scripts/blitz.subscriptions.ip2tor.py subscription-cancel ${ip2torID}
-            echo
-            echo "OK - PRESS ENTER to continue"
-            read key
-            exit 0
-            ;;
-        HTTPS-ON)
-            python /home/admin/config.scripts/blitz.subscriptions.letsencrypt.py create-ssh-dialog
-            exit 0
-            ;;
-        SWITCH-CL)
-            clear
-            /home/admin/config.scripts/bonus.lnbits.sh switch cl
-            echo "Restarting LNbits ..."
-            sudo systemctl restart lnbits
-            echo
-            echo "OK new funding source for LNbits active."
-            echo "PRESS ENTER to continue"
-            read key
-            exit 0
-            ;;
-        SWITCH-LND)
-            clear
-            /home/admin/config.scripts/bonus.lnbits.sh switch lnd
-            echo "Restarting LNbits ..."
-            sudo systemctl restart lnbits
-            echo
-            echo "OK new funding source for LNbits active."
-            echo "PRESS ENTER to continue"
-            read key
-            exit 0
-            ;;
-        BACKUP)
-            clear
-            /home/admin/config.scripts/bonus.lnbits.sh backup
-            echo
-            echo "Backup done"
-            echo "PRESS ENTER to continue"
-            read key
-            exit 0
-            ;;
-        RESTORE)
-            clear
-            # check if backup exist
-            source <(/home/admin/_cache.sh get LNBitsDB)
-            if [ "${LNBitsDB}" == "PostgreSQL" ]; then
-              backup_target="/mnt/hdd/app-data/backup/lnbits_db"
-              backup_file=$(ls -t $backup_target/*.sql | head -n1)
-            else
-              backup_target="/mnt/hdd/app-data/backup/lnbits_sqlite"
-              backup_file=$(ls -t $backup_target/*.tar | head -n1)
-            fi
-            if [ "$backup_file" = "" ]; then
-              echo "ABORT - No Backup found to restore from"
-              exit 1
-            else
-              # build dialog to choose backup file from menu
-              OPTIONS_RESTORE=()
+  IP2TOR-ON)
+    python /home/admin/config.scripts/blitz.subscriptions.ip2tor.py create-ssh-dialog LNBITS ${toraddress} 443
+    exit 0
+    ;;
+  IP2TOR-OFF)
+    clear
+    python /home/admin/config.scripts/blitz.subscriptions.ip2tor.py subscription-cancel ${ip2torID}
+    echo
+    echo "OK - PRESS ENTER to continue"
+    read key
+    exit 0
+    ;;
+  HTTPS-ON)
+    python /home/admin/config.scripts/blitz.subscriptions.letsencrypt.py create-ssh-dialog
+    exit 0
+    ;;
+  SWITCH-CL)
+    clear
+    /home/admin/config.scripts/bonus.lnbits.sh switch cl
+    echo "Restarting LNbits ..."
+    sudo systemctl restart lnbits
+    echo
+    echo "OK new funding source for LNbits active."
+    echo "PRESS ENTER to continue"
+    read key
+    exit 0
+    ;;
+  SWITCH-LND)
+    clear
+    /home/admin/config.scripts/bonus.lnbits.sh switch lnd
+    echo "Restarting LNbits ..."
+    sudo systemctl restart lnbits
+    echo
+    echo "OK new funding source for LNbits active."
+    echo "PRESS ENTER to continue"
+    read key
+    exit 0
+    ;;
+  BACKUP)
+    clear
+    /home/admin/config.scripts/bonus.lnbits.sh backup
+    echo
+    echo "Backup done"
+    echo "PRESS ENTER to continue"
+    read key
+    exit 0
+    ;;
+  ADMINUI)
+    clear
+    echo
+    if [ ${activatedAdminUI} -eq 0 ]; then
+      echo "Activate Admin UI"
+      sudo sed -i "/^LNBITS_ADMIN_UI=/d" $lnbitsConfig
+      sudo bash -c "echo 'LNBITS_ADMIN_UI=true' >> ${lnbitsConfig}"
+    else
+      echo "Deactivate Admin UI"
+      sudo sed -i "/^LNBITS_ADMIN_UI=/d" $lnbitsConfig
+      sudo bash -c "echo 'LNBITS_ADMIN_UI=false' >> ${lnbitsConfig}"
+    fi
+    echo "Restarting LNbits ..."
+    sudo systemctl restart lnbits
+    echo "PRESS ENTER to continue"
+    read key
+    exit 0
+    ;;
+  RESTORE)
+    clear
+    # check if backup exist
+    source <(/home/admin/_cache.sh get LNBitsDB)
+    if [ "${LNBitsDB}" == "PostgreSQL" ]; then
+      backup_target="/mnt/hdd/app-data/backup/lnbits_db"
+      backup_file=$(ls -t $backup_target/*.sql | head -n1)
+    else
+      backup_target="/mnt/hdd/app-data/backup/lnbits_sqlite"
+      backup_file=$(ls -t $backup_target/*.tar | head -n1)
+    fi
+    if [ "$backup_file" = "" ]; then
+      echo "ABORT - No Backup found to restore from"
+      exit 1
+    else
+      # build dialog to choose backup file from menu
+      OPTIONS_RESTORE=()
 
-              counter=0
-              cd $backup_target
-              for f in `find *.* -maxdepth 1 -type f`; do
-                [[ -f "$f" ]] || continue
-                counter=$(($counter+1))
-                OPTIONS_RESTORE+=($counter "$f")
-              done
+      counter=0
+      cd $backup_target
+      for f in $(find *.* -maxdepth 1 -type f); do
+        [[ -f "$f" ]] || continue
+        counter=$(($counter + 1))
+        OPTIONS_RESTORE+=($counter "$f")
+      done
 
-              WIDTH_RESTORE=66
-              CHOICE_HEIGHT_RESTORE=$(("${#OPTIONS_RESTORE[@]}/2+1"))
-              HEIGHT_RESTORE=$((CHOICE_HEIGHT_RESTORE+7))
-              CHOICE_RESTORE=$(dialog --clear \
-              --title " LNbits - Backup restore" \
-              --ok-label "Select" \
-              --cancel-label "Back" \
-              --menu "Choose one of the following backups:" \
-              $HEIGHT_RESTORE $WIDTH_RESTORE $CHOICE_HEIGHT_RESTORE \
-              "${OPTIONS_RESTORE[@]}" \
-              2>&1 >/dev/tty)
+      WIDTH_RESTORE=66
+      CHOICE_HEIGHT_RESTORE=$(("${#OPTIONS_RESTORE[@]}/2+1"))
+      HEIGHT_RESTORE=$((CHOICE_HEIGHT_RESTORE + 7))
+      CHOICE_RESTORE=$(dialog --clear \
+        --title " LNbits - Backup restore" \
+        --ok-label "Select" \
+        --cancel-label "Back" \
+        --menu "Choose one of the following backups:" \
+        $HEIGHT_RESTORE $WIDTH_RESTORE $CHOICE_HEIGHT_RESTORE \
+        "${OPTIONS_RESTORE[@]}" \
+        2>&1 >/dev/tty)
 
-              # start restore with selected backup
-              clear
-              if [ "$CHOICE_RESTORE" != "" ]; then
-                backup_file=${backup_target}/${OPTIONS_RESTORE[$(($CHOICE_RESTORE*2-1))]}
-                /home/admin/config.scripts/bonus.lnbits.sh restore "${backup_file}"
-                echo
-                echo "Restore done"
-                echo "PRESS ENTER to continue"
-                read key
-              fi
-              exit 0
-            fi
-            ;;
-        MIGRATE-DB)
-            clear
-            dialog --title "MIGRATE LNBITS" --yesno "
+      # start restore with selected backup
+      clear
+      if [ "$CHOICE_RESTORE" != "" ]; then
+        backup_file=${backup_target}/${OPTIONS_RESTORE[$(($CHOICE_RESTORE * 2 - 1))]}
+        /home/admin/config.scripts/bonus.lnbits.sh restore "${backup_file}"
+        echo
+        echo "Restore done"
+        echo "PRESS ENTER to continue"
+        read key
+      fi
+      exit 0
+    fi
+    ;;
+  MIGRATE-DB)
+    clear
+    dialog --title "MIGRATE LNBITS" --yesno "
 Do you want to proceed the migration?
 
 Try to migrate your LNBits SQLite database to PostgreSQL.
 
 This can fail for unknown circumstances. Revert of this process is possible afterwards, a backup will be saved.
             " 12 65
-            if [ $? -eq 0 ]; then
-              clear
-              /home/admin/config.scripts/bonus.lnbits.sh migrate
-              echo
-              migrateMsg
-              echo
-              echo "OK please test your LNBits installation."
-              echo "PRESS ENTER to continue"
-              read key
-            fi
-            exit 0
-            ;;
-        *)
-            clear
-            exit 0
+    if [ $? -eq 0 ]; then
+      clear
+      /home/admin/config.scripts/bonus.lnbits.sh migrate
+      echo
+      migrateMsg
+      echo
+      echo "OK please test your LNBits installation."
+      echo "PRESS ENTER to continue"
+      read key
+    fi
+    exit 0
+    ;;
+  *)
+    clear
+    exit 0
+    ;;
   esac
 
   exit 0
@@ -381,7 +411,7 @@ if [ "$1" = "status" ]; then
 
     # auth method is to call with a certain useer id
     #admin_userid=$(sudo cat /home/lnbits/lnbits/.super_user)
-    admin_userid=$(sudo cat /mnt/hdd/app-data/LNBits/data/.super_user);
+    admin_userid=$(sudo cat /mnt/hdd/app-data/LNBits/data/.super_user)
     echo "authMethod='/wallet?usr=${admin_userid}'"
 
     # check funding source
@@ -454,7 +484,7 @@ if [ "$1" = "prestart" ]; then
 
   # get if its for lnd or cl service
   echo "## lnbits.service PRESTART CONFIG"
-  echo "# --> /home/lnbits/lnbits/.env"
+  echo "# --> ${lnbitsConfig}"
 
   # set values based in funding source in raspiblitz config
   # portprefix is "" |  1 | 3
@@ -505,23 +535,23 @@ if [ "$1" = "prestart" ]; then
     echo "# Updating LND TLS & macaroon data fresh for LNbits config ..."
 
     # set tls.cert path (use | as separator to avoid escaping file path slashes)
-    sed -i "s|^LND_REST_CERT=.*|LND_REST_CERT=/mnt/hdd/app-data/lnd/tls.cert|g" /home/lnbits/lnbits/.env
+    sed -i "s|^LND_REST_CERT=.*|LND_REST_CERT=/mnt/hdd/app-data/lnd/tls.cert|g" $lnbitsConfig
     # set macaroon  path info in .env - USING HEX IMPORT
-    chmod 600 /home/lnbits/lnbits/.env
+    chmod 600 $lnbitsConfig
     macaroonAdminHex=$(xxd -ps -u -c 1000 /mnt/hdd/app-data/lnd/data/chain/${LNBitsNetwork}/${LNBitsChain}net/admin.macaroon)
     macaroonInvoiceHex=$(xxd -ps -u -c 1000 /mnt/hdd/app-data/lnd/data/chain/${LNBitsNetwork}/${LNBitsChain}net/invoice.macaroon)
     macaroonReadHex=$(xxd -ps -u -c 1000 /mnt/hdd/app-data/lnd/data/chain/${LNBitsNetwork}/${LNBitsChain}net/readonly.macaroon)
-    sed -i "s/^LND_REST_ADMIN_MACAROON=.*/LND_REST_ADMIN_MACAROON=${macaroonAdminHex}/g" /home/lnbits/lnbits/.env
-    sed -i "s/^LND_REST_INVOICE_MACAROON=.*/LND_REST_INVOICE_MACAROON=${macaroonInvoiceHex}/g" /home/lnbits/lnbits/.env
-    sed -i "s/^LND_REST_READ_MACAROON=.*/LND_REST_READ_MACAROON=${macaroonReadHex}/g" /home/lnbits/lnbits/.env
+    sed -i "s/^LND_REST_ADMIN_MACAROON=.*/LND_REST_ADMIN_MACAROON=${macaroonAdminHex}/g" $lnbitsConfig
+    sed -i "s/^LND_REST_INVOICE_MACAROON=.*/LND_REST_INVOICE_MACAROON=${macaroonInvoiceHex}/g" $lnbitsConfig
+    sed -i "s/^LND_REST_READ_MACAROON=.*/LND_REST_READ_MACAROON=${macaroonReadHex}/g" $lnbitsConfig
     # set the REST endpoint (use | as separator to avoid escaping slashes)
-    sed -i "s|^LND_REST_ENDPOINT=.*|LND_REST_ENDPOINT=https://127.0.0.1:${portprefix}8080|g" /home/lnbits/lnbits/.env
+    sed -i "s|^LND_REST_ENDPOINT=.*|LND_REST_ENDPOINT=https://127.0.0.1:${portprefix}8080|g" $lnbitsConfig
 
   elif [ "${LNBitsLightning}" == "cl" ]; then
 
-    isUsingCL=$(cat /home/lnbits/lnbits/.env | grep -c "LNBITS_BACKEND_WALLET_CLASS=CLightningWallet")
+    isUsingCL=$(cat $lnbitsConfig | grep -c "LNBITS_BACKEND_WALLET_CLASS=CLightningWallet")
     if [ "${isUsingCL}" != "1" ]; then
-      echo "# FAIL: /home/lnbits/lnbits/.env not set to CLN"
+      echo "# FAIL: ${lnbitsConfig} not set to CLN"
       exit 1
     fi
 
@@ -534,7 +564,7 @@ if [ "$1" = "prestart" ]; then
 
   # protect the admin user id if exists
   # chmod 640 /home/lnbits/lnbits/.super_user 2>/dev/null
-  chmod 640 /mnt/hdd/app-data/LNBits/data/.super_user 2>/dev/null 
+  chmod 640 /mnt/hdd/app-data/LNBits/data/.super_user 2>/dev/null
 
   echo "# OK: prestart finished"
   exit 0 # exit with clean code
@@ -587,21 +617,23 @@ if [ "$1" = "sync" ] || [ "$1" = "repo" ]; then
   # pull latest code
   sudo -u lnbits git pull
 
-  # check if poetry in installed, if not install it
+  echo "# check if poetry in installed, if not install it"
   if ! sudo -u lnbits which poetry; then
     echo "# install poetry"
+    sudo pip3 config set global.break-system-packages true
     sudo pip3 install --upgrade pip
     sudo pip3 install poetry
   fi
-  # do install like this
+
+  echo "# install"
   sudo -u lnbits poetry install
 
-  # make sure default virtaulenv is used
+  echo "# make sure the default virtualenv is used"
   sudo apt-get remove -y python3-virtualenv 2>/dev/null
   sudo pip uninstall -y virtualenv 2>/dev/null
   sudo apt-get install -y python3-virtualenv
 
-  # restart lnbits service
+  echo "# restart lnbits service"
   sudo systemctl restart lnbits
   echo "# server is restarting ... maybe takes some seconds until available"
   exit 0
@@ -619,12 +651,6 @@ if [ "$1" = "install" ]; then
     exit 0
   fi
 
-  echo "# *** INSTALL LNBITS ${VERSION} ***"
-
-  # add lnbits user
-  echo "*** Add the 'lnbits' user ***"
-  sudo adduser --system --group --home /home/lnbits lnbits
-
   # get optional github parameter
   githubUser="lnbits"
   if [ "$2" != "" ]; then
@@ -634,33 +660,52 @@ if [ "$1" = "install" ]; then
     tag="$3"
   fi
 
+  echo "# *** INSTALL LNBITS ***"
+  echo "# githubUser=$githubUser tag=$tag"
+
+  # make sure dependencies are installed
+  sudo apt-get install -y pkg-config build-essential python3-dev libsecp256k1-dev libffi-dev libgmp-dev
+
+  # add lnbits user
+  echo "*** Add the 'lnbits' user ***"
+  sudo adduser --system --group --home /home/lnbits lnbits
+
   # install from GitHub
   echo "# get the github code user(${githubUser}) branch(${tag})"
   sudo rm -r /home/lnbits/lnbits 2>/dev/null
-  cd /home/lnbits  || exit 1
+  cd /home/lnbits || exit 1
   sudo -u lnbits git clone https://github.com/${githubUser}/lnbits lnbits
   cd /home/lnbits/lnbits || exit 1
   sudo -u lnbits git checkout ${tag} || exit 1
 
   # to the install
   echo "# installing application dependencies"
-  cd /home/lnbits/lnbits  || exit 1
+  cd /home/lnbits/lnbits || exit 1
 
-  # check if poetry in installed, if not install it
+  # check if poetry is installed
   if ! sudo -u lnbits which poetry; then
     echo "# install poetry"
+    sudo pip3 config set global.break-system-packages true
     sudo pip3 install --upgrade pip
     sudo pip3 install poetry
   fi
-  # do install like this
-  sudo -u lnbits poetry install
+
+  echo "# install"
+  exitCode=0
+  if sudo -u lnbits poetry install; then
+    echo "Poetry install completed successfully."
+  else
+    echo "Error: Poetry install failed (see above).. waiting 10 seconds"
+    exitCode=1
+    sleep 10
+  fi
 
   # make sure default virtaulenv is used
   sudo apt-get remove -y python3-virtualenv 2>/dev/null
   sudo pip uninstall -y virtualenv 2>/dev/null
   sudo apt-get install -y python3-virtualenv
 
-  exit 0
+  exit $exitCode
 fi
 
 # remove from system
@@ -680,7 +725,6 @@ if [ "$1" = "uninstall" ]; then
 
   exit 0
 fi
-
 
 # on
 if [ "$1" = "1" ] || [ "$1" = "on" ]; then
@@ -755,28 +799,39 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
     exit 1
   fi
 
-  # prepare .env file
-  echo "# preparing env file"
-  sudo rm /home/lnbits/lnbits/.env 2>/dev/null
-  sudo -u lnbits touch /home/lnbits/lnbits/.env
+ # prepare data dir file
+  sudo mkdir -p $lnbitsDataDir
+  sudo chown lnbits:lnbits -R $lnbitsDataDir
 
-  # activate admin user
-  sudo sed -i "/^LNBITS_ADMIN_UI=/d" /home/lnbits/lnbits/.env
-  sudo bash -c "echo 'LNBITS_ADMIN_UI=true' >> /home/lnbits/lnbits/.env"
+  echo "# preparing env file"
+  # delete old .env file or old symbolic link
+  sudo rm /home/lnbits/lnbits/.env 2>/dev/null
+    
+  # make sure .env file exists at data drive
+  if [ ! -f $lnbitsConfig ]; then
+    sudo -u lnbits touch $lnbitsConfig
+    sudo bash -c "echo 'LNBITS_ADMIN_UI=true' >> ${lnbitsConfig}"
+  fi
+  sudo chown lnbits:lnbits $lnbitsConfig
+
+  # crete symbolic link
+  sudo -u lnbits ln -s $lnbitsConfig /home/lnbits/lnbits/.env
 
   if [ ! -e /mnt/hdd/app-data/LNBits/database.sqlite3 ]; then
     echo "# install database: PostgreSQL"
+
     # POSTGRES
     postgresConfig
 
-    # new data directory
-    sudo mkdir -p /mnt/hdd/app-data/LNBits/data
-
     # config update
     # example: postgres://<user>:<password>@<host>/<database>
-    sudo bash -c "echo 'LNBITS_DATABASE_URL=postgres://postgres:postgres@localhost:5432/lnbits_db' >> /home/lnbits/lnbits/.env"
-    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits/data' >> /home/lnbits/lnbits/.env"
+    sudo sed -i "/^LNBITS_DATABASE_URL=/d" $lnbitsConfig 2>/dev/null
+    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" $lnbitsConfig 2>/dev/null
+    sudo bash -c "echo 'LNBITS_DATABASE_URL=postgres://postgres:postgres@localhost:5432/lnbits_db' >> ${lnbitsConfig}"
+    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits/data' >> ${lnbitsConfig}"
+
   else
+
     echo "# install database: SQLite"
     /home/admin/config.scripts/blitz.conf.sh set LNBitsDB "SQLite"
 
@@ -784,13 +839,10 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
     sudo mkdir -p /mnt/hdd/app-data/LNBits
 
     # config update
-    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits' >> /home/lnbits/lnbits/.env"
+    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" $lnbitsConfig 2>/dev/null
+    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits' >> ${lnbitsConfig}"
   fi
   sudo chown lnbits:lnbits -R /mnt/hdd/app-data/LNBits
-
-  # let switch command part do the detail config
-  /home/admin/config.scripts/bonus.lnbits.sh switch ${fundingsource}
-  cd /home/lnbits/lnbits  || exit 1
 
   # open firewall
   echo
@@ -799,6 +851,14 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
   sudo ufw allow 5001 comment 'lnbits HTTPS'
   echo
 
+  # make sure that systemd starts funding source first
+  systemdDependency="bitcoind.service"
+  if [ "${fundingsource}" == "lnd" ]; then
+    systemdDependency="lnd.service"
+  elif [ "${fundingsource}" == "cl" ]; then
+    systemdDependency="lightningd.service"
+  fi
+
   # install service
   echo "*** Install systemd ***"
   cat <<EOF | sudo tee /etc/systemd/system/lnbits.service >/dev/null
@@ -806,8 +866,9 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
 
 [Unit]
 Description=lnbits
-Wants=bitcoind.service
-After=bitcoind.service
+Wants=${systemdDependency}
+After=${systemdDependency}
+PartOf=${systemdDependency}
 
 [Service]
 WorkingDirectory=/home/lnbits/lnbits
@@ -830,6 +891,10 @@ PrivateDevices=true
 WantedBy=multi-user.target
 EOF
 
+  # let switch command part do the detail config
+  /home/admin/config.scripts/bonus.lnbits.sh switch ${fundingsource}
+  cd /home/lnbits/lnbits || exit 1
+
   sudo systemctl enable lnbits
 
   source <(/home/admin/_cache.sh get state)
@@ -842,13 +907,13 @@ EOF
 
   # setup nginx symlinks
   if ! [ -f /etc/nginx/sites-available/lnbits_ssl.conf ]; then
-     sudo cp /home/admin/assets/nginx/sites-available/lnbits_ssl.conf /etc/nginx/sites-available/lnbits_ssl.conf
+    sudo cp /home/admin/assets/nginx/sites-available/lnbits_ssl.conf /etc/nginx/sites-available/lnbits_ssl.conf
   fi
   if ! [ -f /etc/nginx/sites-available/lnbits_tor.conf ]; then
-     sudo cp /home/admin/assets/nginx/sites-available/lnbits_tor.conf /etc/nginx/sites-available/lnbits_tor.conf
+    sudo cp /home/admin/assets/nginx/sites-available/lnbits_tor.conf /etc/nginx/sites-available/lnbits_tor.conf
   fi
   if ! [ -f /etc/nginx/sites-available/lnbits_tor_ssl.conf ]; then
-     sudo cp /home/admin/assets/nginx/sites-available/lnbits_tor_ssl.conf /etc/nginx/sites-available/lnbits_tor_ssl.conf
+    sudo cp /home/admin/assets/nginx/sites-available/lnbits_tor_ssl.conf /etc/nginx/sites-available/lnbits_tor_ssl.conf
   fi
   sudo ln -sf /etc/nginx/sites-available/lnbits_ssl.conf /etc/nginx/sites-enabled/
   sudo ln -sf /etc/nginx/sites-available/lnbits_tor.conf /etc/nginx/sites-enabled/
@@ -924,20 +989,24 @@ if [ "$1" = "switch" ]; then
     exit 1
   fi
 
+  # make lnd.service fallback
+  sudo sed -i 's/Wants=lnd.service/Wants=bitcoind.service/' /etc/systemd/system/lnbits.service
+  sudo sed -i 's/After=lnd.service/After=bitcoind.service/' /etc/systemd/system/lnbits.service
+
   echo "##############"
   echo "# NOTE: If you switch the funding source of a running LNbits instance all sub account will keep balance."
   echo "# Make sure that the new funding source has enough sats to cover the LNbits bookeeping of sub accounts."
   echo "##############"
 
   # remove all old possible settings for former funding source (clean state)
-  sudo sed -i "/^LNBITS_BACKEND_WALLET_CLASS=/d" /home/lnbits/lnbits/.env 2>/dev/null
-  sudo sed -i "/^LND_REST_ENDPOINT=/d" /home/lnbits/lnbits/.env 2>/dev/null
-  sudo sed -i "/^LND_REST_CERT=/d" /home/lnbits/lnbits/.env 2>/dev/null
-  sudo sed -i "/^LND_REST_ADMIN_MACAROON=/d" /home/lnbits/lnbits/.env 2>/dev/null
-  sudo sed -i "/^LND_REST_INVOICE_MACAROON=/d" /home/lnbits/lnbits/.env 2>/dev/null
-  sudo sed -i "/^LND_REST_READ_MACAROON=/d" /home/lnbits/lnbits/.env 2>/dev/null
+  sudo sed -i "/^LNBITS_BACKEND_WALLET_CLASS=/d" $lnbitsConfig 2>/dev/null
+  sudo sed -i "/^LND_REST_ENDPOINT=/d" $lnbitsConfig 2>/dev/null
+  sudo sed -i "/^LND_REST_CERT=/d" $lnbitsConfig 2>/dev/null
+  sudo sed -i "/^LND_REST_ADMIN_MACAROON=/d" $lnbitsConfig 2>/dev/null
+  sudo sed -i "/^LND_REST_INVOICE_MACAROON=/d" $lnbitsConfig 2>/dev/null
+  sudo sed -i "/^LND_REST_READ_MACAROON=/d" $lnbitsConfig 2>/dev/null
   sudo /usr/sbin/usermod -G lnbits lnbits
-  sudo sed -i "/^CLIGHTNING_RPC=/d" /home/lnbits/lnbits/.env 2>/dev/null
+  sudo sed -i "/^CLIGHTNING_RPC=/d" $lnbitsConfig 2>/dev/null
 
   # LND CONFIG
   if [ "${fundingsource}" == "lnd" ] || [ "${fundingsource}" == "tlnd" ] || [ "${fundingsource}" == "slnd" ]; then
@@ -950,12 +1019,12 @@ if [ "$1" = "switch" ]; then
 
     # prepare config entries in lnbits config for lnd
     echo "# preparing lnbits config for lnd"
-    sudo bash -c "echo 'LNBITS_BACKEND_WALLET_CLASS=LndRestWallet' >> /home/lnbits/lnbits/.env"
-    sudo bash -c "echo 'LND_REST_ENDPOINT=https://127.0.0.1:8080' >> /home/lnbits/lnbits/.env"
-    sudo bash -c "echo 'LND_REST_CERT=' >> /home/lnbits/lnbits/.env"
-    sudo bash -c "echo 'LND_REST_ADMIN_MACAROON=' >> /home/lnbits/lnbits/.env"
-    sudo bash -c "echo 'LND_REST_INVOICE_MACAROON=' >> /home/lnbits/lnbits/.env"
-    sudo bash -c "echo 'LND_REST_READ_MACAROON=' >> /home/lnbits/lnbits/.env"
+    sudo bash -c "echo 'LNBITS_BACKEND_WALLET_CLASS=LndRestWallet' >> ${lnbitsConfig}"
+    sudo bash -c "echo 'LND_REST_ENDPOINT=https://127.0.0.1:8080' >> ${lnbitsConfig}"
+    sudo bash -c "echo 'LND_REST_CERT=' >> ${lnbitsConfig}"
+    sudo bash -c "echo 'LND_REST_ADMIN_MACAROON=' >> ${lnbitsConfig}"
+    sudo bash -c "echo 'LND_REST_INVOICE_MACAROON=' >> ${lnbitsConfig}"
+    sudo bash -c "echo 'LND_REST_READ_MACAROON=' >> ${lnbitsConfig}"
 
   fi
 
@@ -980,8 +1049,8 @@ if [ "$1" = "switch" ]; then
     fi
 
     echo "# preparing lnbits config for CLN"
-    sudo bash -c "echo 'LNBITS_BACKEND_WALLET_CLASS=CLightningWallet' >> /home/lnbits/lnbits/.env"
-    sudo bash -c "echo 'CLIGHTNING_RPC=/home/bitcoin/.lightning/bitcoin${clrpcsubdir}/lightning-rpc' >> /home/lnbits/lnbits/.env"
+    sudo bash -c "echo 'LNBITS_BACKEND_WALLET_CLASS=CLightningWallet' >> ${lnbitsConfig}"
+    sudo bash -c "echo 'CLIGHTNING_RPC=/home/bitcoin/.lightning/bitcoin${clrpcsubdir}/lightning-rpc' >> ${lnbitsConfig}"
   fi
 
   # set raspiblitz config value for funding
@@ -1006,7 +1075,7 @@ if [ "$1" = "0" ] || [ "$1" = "off" ]; then
   else
     if (whiptail --title " DELETE DATA? " --yesno "Do you want to delete\nthe LNbits Server Data?" 8 30); then
       deleteData=1
-   else
+    else
       deleteData=0
     fi
   fi
@@ -1046,6 +1115,7 @@ if [ "$1" = "0" ] || [ "$1" = "off" ]; then
     echo "# deleting data"
     sudo -u postgres psql -c "drop database lnbits_db;"
     sudo -u postgres psql -c "drop user lnbits_user;"
+    sudo rm /home/lnbits/lnbits/.env
     sudo rm -R /mnt/hdd/app-data/LNBits
   else
     echo "# keeping data"
@@ -1069,7 +1139,7 @@ if [ "$1" = "backup" ]; then
   else
     # sqlite backup
     backup_target="/mnt/hdd/app-data/backup/lnbits_sqlite"
-    backup_file="lnbits_sqlite_`date +%d`-`date +%m`-`date +%Y`_`date +%H`-`date +%M`_fs.tar"
+    backup_file="lnbits_sqlite_$(date +%d)-$(date +%m)-$(date +%Y)_$(date +%H)-$(date +%M)_fs.tar"
     if [ ! -d $backup_target ]; then
       sudo mkdir -p $backup_target 1>&2
     fi
@@ -1166,11 +1236,9 @@ if [ "$1" = "migrate" ]; then
     # create new backup
     sudo tar -cf /mnt/hdd/app-data/LNBits_sqlitedb_backup.tar -C /mnt/hdd/app-data LNBits/
 
-    # remove existent config for database
-    sudo sed -i "/^LNBITS_DATABASE_URL=/d" /home/lnbits/lnbits/.env 2>/dev/null
-    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" /home/lnbits/lnbits/.env 2>/dev/null
     # restore sqlite database config
-    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits' >> /home/lnbits/lnbits/.env"
+    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" $lnbitsConfig 2>/dev/null
+    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits' >> ${lnbitsConfig}"
 
     # stop after sync was done
     sudo systemctl stop lnbits
@@ -1182,7 +1250,8 @@ if [ "$1" = "migrate" ]; then
 
     # example: postgres://<user>:<password>@<host>/<database>
     # add new postgres config
-    sudo bash -c "echo 'LNBITS_DATABASE_URL=postgres://lnbits_user:raspiblitz@localhost:5432/lnbits_db' >> /home/lnbits/lnbits/.env"
+    sudo sed -i "/^LNBITS_DATABASE_URL=/d" $lnbitsConfig 2>/dev/null
+    sudo bash -c "echo 'LNBITS_DATABASE_URL=postgres://lnbits_user:raspiblitz@localhost:5432/lnbits_db' >> ${lnbitsConfig}"
 
     # clean start on new postgres db prior migration
     echo "# LNBits first start with clean PostgreSQL"
@@ -1191,9 +1260,8 @@ if [ "$1" = "migrate" ]; then
     # execStartPre is not enough, wait for lnbits is finally running
     count=0
     count_max=30
-    while ! nc -zv 127.0.0.1 5000 2>/dev/null;
-    do
-      count=`expr $count + 1`
+    while ! nc -zv 127.0.0.1 5000 2>/dev/null; do
+      count=$(expr $count + 1)
       echo "wait for LNBIts to start (${count}s/${count_max}s)"
       sleep 1
       if [ $count = $count_max ]; then
@@ -1225,8 +1293,8 @@ if [ "$1" = "migrate" ]; then
     sudo chown lnbits:lnbits -R /mnt/hdd/app-data/LNBits/
 
     echo "# Configure .env"
-    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" /home/lnbits/lnbits/.env 2>/dev/null
-    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits/data' >> /home/lnbits/lnbits/.env"
+    sudo sed -i "/^LNBITS_DATA_FOLDER=/d" $lnbitsConfig 2>/dev/null
+    sudo bash -c "echo 'LNBITS_DATA_FOLDER=/mnt/hdd/app-data/LNBits/data' >> ${lnbitsConfig}"
 
     # setting value in raspi blitz config
     /home/admin/config.scripts/blitz.conf.sh set LNBitsMigrate "off"

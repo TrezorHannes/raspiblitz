@@ -11,45 +11,72 @@ REPO="https://github.com/raspiblitz/raspiblitz"
 # folders to store the build results
 BUILDFOLDER="images"
 
+# check if started with sudo
+if [ "$EUID" -ne 0 ]; then
+  echo "error='run as root / may use sudo'"
+  exit 1
+fi
+
+# usage info
+echo "packer.sh [BRANCH] [arm|x86] [min|fat] [?lastcommithash]"
 echo "Build RaspiBlitz install images on a Debian LIVE system"
 echo "From repo (change in script is needed):"
 echo $REPO
 echo "Results will be stored in:"
 echo $BUILDFOLDER
+echo "Start this script in the root of an writable 128GB NTFS formatted USB drive."
 
-# give info if not started with parameters
-if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "-help" ]; then
-  echo "Start this script in the root of an writable 128GB NTFS formatted USB drive:"
-  echo "packer.sh [BRANCH] [arm|x86] [min|fat] [?lastcommithash]"
+# check if internet is available
+if ping -c 1 "1.1.1.1" &> /dev/null; then
+  echo "# checking internet"
+else
+  echo "error='script needs internet connection to run'"
   exit 1
 fi
 
-BRANCH=$1
-ARCH=$2
-TYPE=$3
-COMMITHASH=$4
+# get parameters
+if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "-help" ]; then
+
+  # by input
+  read -p "Press ENTER to continue or CTRL+C to exit"
+  read -p "Enter the branch to build: " BRANCH
+  read -p "Enter the architecture to build (arm|x86): " ARCH
+  read -p "Enter the type to build (min|fat): " TYPE
+  read -p "Enter the last commit hash to check (optional): " COMMITHASH
+
+else
+
+  # by command line
+  BRANCH=$1
+  ARCH=$2
+  TYPE=$3
+  COMMITHASH=$4
+  
+fi
 
 # check if branch is set
-if [ "$BRANCH" == "[BRANCH]" ]; then
+if [ ${#BRANCH} -eq 0 ]; then
   echo "error='branch not set'"
   exit 1
 fi
 
-# check if output is set
-if [ -z "$ARCH" ]; then
+# check if arch is set
+if [ ${#ARCH} -eq 0 ]; then
   echo "error='ARCH not set'"
   exit 1
 fi
-
-# check if output is set
-if [ -z "TYPE" ]; then
-  echo "error='TYPE not set'"
+if [ "$ARCH" != "arm" ] && [ "$ARCH" != "x86" ]; then
+  echo "error='ARCH not supported'"
   exit 1
 fi
 
-# check if started with sudo
-if [ "$EUID" -ne 0 ]; then
-  echo "error='run as root / may use sudo'"
+# check if type is set
+if [ ${#TYPE} -eq 0 ]; then
+  echo "error='TYPE not set'"
+  exit 1
+fi
+if [ "$TYPE" != "min" ] && [ "$TYPE" != "fat" ]; then
+  echo "error='TYPE not supported'"
   exit 1
 fi
 
@@ -71,6 +98,13 @@ cd raspiblitz
 
 # checkout the desired branch
 git checkout $BRANCH
+if [ $? -gt 0 ]; then
+  cd ..
+  rm -rf raspiblitz 2>/dev/null
+  echo "# BRANCH: ${BRANCH}"
+  echo "error='git checkout BRANCH failed'"
+  exit 1
+fi
 
 # check commit hash if set
 if [ ${#COMMITHASH} -gt 0 ]; then
@@ -79,6 +113,8 @@ if [ ${#COMMITHASH} -gt 0 ]; then
   echo "# actual(${actualCOMMITHASH}) ?= wanted(${COMMITHASH})"
   matches=$(echo "${actualCOMMITHASH}" | grep -c "${COMMITHASH}")
   if [ ${matches} -eq 0 ]; then
+    cd ..
+    rm -rf raspiblitz 2>/dev/null
     echo "error='COMMITHASH of branch does not match'"
     exit 1
   fi
@@ -86,6 +122,11 @@ if [ ${#COMMITHASH} -gt 0 ]; then
 else
   echo "# NO COMMITHASH CHECK"
 fi
+
+# make sure make build runs thru
+safedir=$(realpath ./ci/arm64-rpi/packer-builder-arm)
+echo "# Setting safe.directory to: ${safedir}"
+git config --global --add safe.directory "${safedir}"
 
 # get code version
 codeVersion=$(cat ./home.admin/_version.info | grep 'codeVersion="' | cut -d'"' -f2)
@@ -102,15 +143,15 @@ echo "# Date: ${dateString}"
 if [ "${ARCH}" == "arm" ] && [ "${TYPE}" == "min" ]; then
   PACKERTARGET="arm64-rpi-lean-image"
   PACKERBUILDPATH="./raspiblitz/ci/arm64-rpi/packer-builder-arm/raspiblitz-arm64-rpi-lean.img"
-  PACKERFINALFILE="raspiblitz-min-${codeVersion}-${dateString}.img"
+  PACKERFINALFILE="raspiblitz-min-v${codeVersion}-${dateString}.img"
 elif [ "${ARCH}" == "arm" ] && [ "${TYPE}" == "fat" ]; then
   PACKERTARGET="arm64-rpi-fatpack-image" 
-  PACKERBUILDPATH="./raspiblitz/ci/arm64-rpi/packer-builder-arm/TODO" #TODO
-  PACKERFINALFILE="raspiblitz-fat-${codeVersion}-${dateString}.img"
+  PACKERBUILDPATH="./raspiblitz/ci/arm64-rpi/packer-builder-arm/raspiblitz-arm64-rpi-fat.img"
+  PACKERFINALFILE="raspiblitz-fat-v${codeVersion}-${dateString}.img"
 elif [ "${ARCH}" == "x86" ] && [ "${TYPE}" == "min" ]; then
   PACKERTARGET="amd64-lean-server-legacyboot-image"
   PACKERBUILDPATH="./raspiblitz/ci/amd64/builds/raspiblitz-amd64-debian-lean-qemu/raspiblitz-amd64-debian-lean.qcow2"
-  PACKERFINALFILE="raspiblitz-amd64-min-${codeVersion}-${dateString}.qcow2"
+  PACKERFINALFILE="raspiblitz-amd64-min-v${codeVersion}-${dateString}.qcow2"
 else
   echo "error='$ARCH-$TYPE not supported'"
   exit 1
@@ -147,7 +188,7 @@ echo "# moving build to timestamped folder ./${BUILDFOLDER}"
 cd ..
 mkdir "${BUILDFOLDER}" 2>/dev/null
 
-#check that Build folder exists
+# check that Build folder exists
 if [ ! -d "./${BUILDFOLDER}" ]; then
   echo "# FAILED CREATING BUILD FOLDER: ./${BUILDFOLDER}"
   exit 1
@@ -200,7 +241,7 @@ fi
 
 
 echo "# clean up"
-rm -rf raspiblitz 2>/dev/null
+rm -rf ./../raspiblitz 2>/dev/null
 
 echo "# SIGN & SECURE IMAGE ###########################################"
 echo

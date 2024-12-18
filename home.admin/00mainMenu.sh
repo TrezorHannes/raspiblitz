@@ -92,6 +92,9 @@ fi
 if [ "${ElectRS}" == "on" ]; then
   OPTIONS+=(ELECTRS "Electrum Rust Server")
 fi
+if [ "${fulcrum}" == "on" ]; then
+  OPTIONS+=(FULCRUM "Fulcrum Electrum Server")
+fi
 if [ "${BTCRPCexplorer}" == "on" ]; then
   OPTIONS+=(EXPLORE "BTC RPC Explorer")
 fi
@@ -156,9 +159,6 @@ fi
 if [ "${circuitbreaker}" == "on" ]; then
   OPTIONS+=(CIRCUITBREAKER "Circuitbreaker (LND firewall)")
 fi
-if [ "${tallycoinConnect}" == "on" ]; then
-  OPTIONS+=(TALLY "Tallycoin Connect")
-fi
 if [ "${squeaknode}" == "on" ]; then
   OPTIONS+=(SQUEAKNODE "Squeaknode")
 fi
@@ -167,6 +167,21 @@ if [ "${lightningtipbot}" == "on" ]; then
 fi
 if [ "${fints}" == "on" ]; then
   OPTIONS+=(FINTS "Show FinTS/HBCI details")
+fi
+if [ "${labelbase}" == "on" ]; then
+  OPTIONS+=(LABELBASE "Labelbase (UTXO labeling)")
+fi
+if [ "${publicpool}" == "on" ]; then
+  OPTIONS+=(PUBLICPOOL "Public Pool (Bitcoin Solo Mining)")
+fi
+if [ "${tailscale}" == "on" ]; then
+  OPTIONS+=(TAILSCALE "Tailscale VPN")
+fi
+if [ "${telegraf}" == "on" ]; then
+  OPTIONS+=(TELEGRAF "Telegraf InfluxDB/Grafana Metrics")
+fi
+if [ "${albyhub}" == "on" ]; then
+  OPTIONS+=(ALBYHUB "AlbyHub")
 fi
 
 # dont offer to switch to "testnet view for now" - so no wswitch back to mainnet needed
@@ -262,6 +277,9 @@ case $CHOICE in
         ELECTRS)
             /home/admin/config.scripts/bonus.electrs.sh menu
             ;;
+        FULCRUM)
+            /home/admin/config.scripts/bonus.fulcrum.sh menu
+            ;;
         LIT)
             /home/admin/config.scripts/bonus.lit.sh menu
             ;;
@@ -304,11 +322,8 @@ case $CHOICE in
         THUB)
             sudo /home/admin/config.scripts/bonus.thunderhub.sh menu
             ;;
-        TALLY)
-            sudo /home/admin/config.scripts/bonus.tallycoin-connect.sh menu
-            ;;
         ZEROTIER)
-            sudo /home/admin/config.scripts/bonus.zerotier.sh menu
+            sudo /home/admin/config.scripts/internet.zerotier.sh menu
             ;;
         SPHINX)
             sudo /home/admin/config.scripts/bonus.sphinxrelay.sh menu
@@ -328,8 +343,23 @@ case $CHOICE in
         CIRCUITBREAKER)
             sudo /home/admin/config.scripts/bonus.circuitbreaker.sh menu
             ;;
+        LABELBASE)
+            sudo /home/admin/config.scripts/bonus.labelbase.sh menu
+            ;;
+        PUBLICPOOL)
+            /home/admin/config.scripts/bonus.publicpool.sh menu
+            ;;
+        TAILSCALE)
+            sudo /home/admin/config.scripts/internet.tailscale.sh menu
+            ;;
+        TELEGRAF)
+            /home/admin/config.scripts/bonus.telegraf.sh menu
+            ;;
         FINTS)
             sudo /home/admin/config.scripts/bonus.fints.sh menu
+            ;;
+        ALBYHUB)
+            /home/admin/config.scripts/bonus.albyhub.sh menu
             ;;
         TESTNETS)
             /home/admin/00parallelChainsMenu.sh

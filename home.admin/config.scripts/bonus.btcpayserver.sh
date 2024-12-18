@@ -3,22 +3,22 @@
 # Based on: https://gist.github.com/normandmickey/3f10fc077d15345fb469034e3697d0d0
 
 # https://github.com/dgarage/NBXplorer/tags
-NBXplorerVersion="v2.5.0"
+NBXplorerVersion="v2.5.2"
 # https://github.com/btcpayserver/btcpayserver/releases
-BTCPayVersion="v1.12.5"
+BTCPayVersion="v1.13.0"
 
 # check who signed the release (person that published release)
-PGPsigner="nicolasdorier"
-PGPpubkeyLink="https://keybase.io/nicolasdorier/pgp_keys.asc"
-PGPpubkeyFingerprint="AB4CFA9895ACA0DBE27F6B346618763EF09186FE"
+#PGPsigner="nicolasdorier"
+#PGPpubkeyLink="https://keybase.io/nicolasdorier/pgp_keys.asc"
+#PGPpubkeyFingerprint="AB4CFA9895ACA0DBE27F6B346618763EF09186FE"
 # ---
 #PGPsigner="Kukks"
 #PGPpubkeyLink="https://github.com/${PGPsigner}.gpg"
 #PGPpubkeyFingerprint="8E5530D9D1C93097"
 # ---
-#PGPsigner="web-flow"
-#PGPpubkeyLink="https://github.com/web-flow.gpg"
-#PGPpubkeyFingerprint="(4AEE18F83AFDEB23|B5690EEEBB952194)"
+PGPsigner="web-flow"
+PGPpubkeyLink="https://github.com/web-flow.gpg"
+PGPpubkeyFingerprint="B5690EEEBB952194"
 
 # command info
 if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "-help" ]; then
@@ -487,9 +487,23 @@ if [ "$1" = "install" ]; then
   echo "# Install NBXplorer $NBXplorerVersion"
   cd /home/btcpay || exit 1
   echo "# Download the NBXplorer source code $NBXplorerVersion"
-  sudo -u btcpay git clone https://github.com/dgarage/NBXplorer.git 2>/dev/null
-  cd NBXplorer || exit 1
-  sudo -u btcpay git reset --hard $NBXplorerVersion
+  sudo -u btcpay git clone https://github.com/dgarage/NBXplorer.git
+  if [ ! -d "/home/btcpay/NBXplorer" ]; then
+    echo "# FAIL! on first git clone - retrying with snapshot download."
+    sudo -u btcpay curl -L https://github.com/dgarage/NBXplorer/archive/refs/tags/$NBXplorerVersion.tar.gz -o NBXplorer.tar.gz
+    sudo -u btcpay tar -xzvf NBXplorer.tar.gz
+    sudo -u btcpay mv NBXplorer-* NBXplorer
+    if [ ! -d "/home/btcpay/NBXplorer" ]; then
+      echo "# FAIL! also on second git clone of NBXplorer - uninstall & exiting."
+      /home/admin/config.scripts/bonus.btcpayserver.sh uninstall
+      exit 1
+    fi
+    cd NBXplorer
+  else
+    echo "# OK - git clone of NBXplorer successful."
+    cd NBXplorer
+    sudo -u btcpay git reset --hard $NBXplorerVersion
+  fi
   # PGP verify
   NBXPGPsigner="nicolasdorier"
   NBXPGPpubkeyLink="https://keybase.io/nicolasdorier/pgp_keys.asc"
@@ -515,7 +529,6 @@ if [ "$1" = "install" ]; then
   # from the build.sh with path
   sudo -u btcpay /home/btcpay/dotnet/dotnet build -c Release \
     /home/btcpay/btcpayserver/BTCPayServer/BTCPayServer.csproj || exit 1
-
   exit 0
 fi
 
@@ -799,9 +812,6 @@ if [ "$1" = "0" ] || [ "$1" = "off" ]; then
   fi
   echo "# OK BTCPayServer deactivated."
 
-  echo "# delete the btcpay user home directory"
-  sudo userdel -rf btcpay 2>/dev/null
-
   # needed for API/WebUI as signal that install ran thru
   echo "result='OK'"
 
@@ -861,12 +871,19 @@ if [ "$1" = "update" ]; then
     TAG=$(git tag | sort -V | tail -1)
     echo "# Reset to the latest release tag: $TAG"
     sudo -u btcpay git reset --hard $TAG
+
     PGPsigner="nicolasdorier"
     PGPpubkeyLink="https://keybase.io/nicolasdorier/pgp_keys.asc"
     PGPpubkeyFingerprint="AB4CFA9895ACA0DBE27F6B346618763EF09186FE"
-
-    sudo -u btcpay /home/admin/config.scripts/blitz.git-verify.sh \
-      "${PGPsigner}" "${PGPpubkeyLink}" "${PGPpubkeyFingerprint}" || exit 1
+    if ! sudo -u btcpay /home/admin/config.scripts/blitz.git-verify.sh \
+      "${PGPsigner}" "${PGPpubkeyLink}" "${PGPpubkeyFingerprint}"; then
+      # try with webflow
+      PGPsigner="web-flow"
+      PGPpubkeyLink="https://github.com/web-flow.gpg"
+      PGPpubkeyFingerprint="B5690EEEBB952194"
+      sudo -u btcpay /home/admin/config.scripts/blitz.git-verify.sh \
+        "${PGPsigner}" "${PGPpubkeyLink}" "${PGPpubkeyFingerprint}" || exit 1
+    fi
 
     echo "# Build NBXplorer $TAG"
     # from the build.sh with path

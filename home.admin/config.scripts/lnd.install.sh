@@ -4,12 +4,12 @@
 ## based on https://raspibolt.github.io/raspibolt/raspibolt_40_lnd.html#lightning-lnd
 ## see LND releases: https://github.com/lightningnetwork/lnd/releases
 ### If you change here - make sure to also change interims version in lnd.update.sh #!
-lndVersion="0.17.3-beta"
+lndVersion="0.18.3-beta"
 
 # olaoluwa
 PGPauthor="roasbeef"
-PGPpkeys="https://keybase.io/roasbeef/pgp_keys.asc"
-PGPcheck="E4D85299674B2D31FAA1892E372CBD7633C61696"
+PGPpkeys="https://raw.githubusercontent.com/lightningnetwork/lnd/master/scripts/keys/roasbeef.asc"
+PGPcheck="A5B61896952D9FDA83BC054CDC42612E89237182"
 
 # guggero
 # PGPauthor="guggero"
@@ -89,7 +89,7 @@ if [ "$1" = "install" ] ; then
   # check if lnd binary is already installed
   if [ $(sudo -u admin lnd --version 2>/dev/null| grep -c 'lnd') -gt 0 ]; then
     echo "lnd binary already installed - done"
-    exit 1
+    exit 
   fi
 
   # get LND resources
@@ -344,6 +344,7 @@ Description=Lightning Network Daemon on $CHAIN
 # Make sure lnd starts after bitcoind is ready
 Requires=${netprefix}bitcoind.service
 After=${netprefix}bitcoind.service
+PartOf=${netprefix}bitcoind.service
 
 [Service]
 EnvironmentFile=/mnt/hdd/raspiblitz.conf
@@ -489,6 +490,7 @@ alias ${netprefix}lndconf=\"sudo nano /home/bitcoin/.lnd/${netprefix}lnd.conf\"\
   fi
 
   # needed to make lnd.newwallet.py work
+  pip config set global.break-system-packages true
   pip install --upgrade google-api-python-client
 
   exit 0

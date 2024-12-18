@@ -55,6 +55,11 @@ function blitzhelp() {
   echo "  cache        check on chache system state"
   echo "  github       jumping directly into the options to change branch/repo/pr"
   echo
+  echo "Development with VM:"
+  echo "  sync         sync all repos from shared folder"
+  echo "  sync code    sync only main raspiblitz repo from shared folder"
+  echo "  sync api     sync only blitz api repo from shared folder"
+  echo  
   echo "Power:"
   echo "  restart      restart the node"
   echo "  off          shutdown the node"
@@ -81,7 +86,7 @@ function blitzhelp() {
   echo "  whitepaper   download the whitepaper from the blockchain to /home/admin/bitcoin.pdf"
   echo "  notifyme     wrapper for blitz.notify.sh that will send a notification using the configured method and settings"
   echo "  suez         visualize channels (for the default ln implementation and chain when installed)"
-  exho "  lnproxy      wrap invoices with lnproxy"
+  echo "  lnproxy      wrap invoices with lnproxy"
   echo
   echo "LND:"
   echo "  lncli        LND commandline interface (when installed)"
@@ -136,6 +141,7 @@ function check() {
 
 # command: release
 function release() {
+  firstPARAM=$1
   echo "Command to prepare your RaspiBlitz installation for sd card image:"
   echo "- delete logs"
   echo "- clean raspiblitz.info"
@@ -146,7 +152,7 @@ function release() {
   echo "- shutdown"
   confirmMsg release
   if [ $confirm -eq 1 ]; then
-    /home/admin/config.scripts/blitz.preparerelease.sh
+    /home/admin/config.scripts/blitz.release.sh $firstPARAM
   fi
 }
 
@@ -156,6 +162,8 @@ function fatpack() {
   confirmMsg fatpack
   if [ $confirm -eq 1 ]; then
     sudo /home/admin/config.scripts/blitz.fatpack.sh
+    # raspberry pi fatpack has lcd display be default
+    sudo /home/admin/config.scripts/blitz.display.sh set-display lcd
   fi
 }
 
@@ -172,7 +180,7 @@ function debug() {
   if [ "$1" = "-l" ]||[ "$1" = "--link" ]; then
     proxy="-X 5 -x localhost:9050"
     if [ "$2" = "-n" ]||[ "$2" = "--no-tor" ]; then proxy=""; fi
-    cat /var/cache/raspiblitz/debug.log | nc ${proxy} termbin.com 9999 | sed "s/termbin.com/l.termbin.com/"
+    cat /var/cache/raspiblitz/debug.log | nc ${proxy} termbin.com 9999
   else
     cat /var/cache/raspiblitz/debug.log
   fi
@@ -212,6 +220,13 @@ function patch() {
     sudo /home/admin/config.scripts/blitz.web.ui.sh update
   fi
 
+  echo
+}
+
+# command: sync
+# sync VM with shared folder
+function sync() {
+  sudo /home/admin/config.scripts/blitz.vm.sh sync ${1}
   echo
 }
 
@@ -345,8 +360,8 @@ function bos() {
 # switch to the pyblock user for PyBLOCK
 function pyblock() {
   if [ $(grep -c "pyblock=on" < /mnt/hdd/raspiblitz.conf) -eq 1 ]; then
-    cd /home/pyblock
-    sudo -u pyblock /home/pyblock/.local/bin/pyblock
+    cd /home/pyblock/pyblock
+    sudo -u pyblock poetry run python -m pybitblock.console
   else
     echo "PyBlock is not installed - to install run:"
     echo "/home/admin/config.scripts/bonus.pyblock.sh on"

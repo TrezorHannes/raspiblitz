@@ -1,16 +1,17 @@
 #!/bin/bash
 
 # https://github.com/romanz/electrs/releases
-ELECTRSVERSION="v0.10.2"
+ELECTRSVERSION="v0.10.6"
 
 # command info
 if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "-help" ]; then
- echo "config script to switch the Electrum Rust Server on or off"
- echo "bonus.electrs.sh status -> dont call in loops"
- echo "bonus.electrs.sh status-sync"
- echo "bonus.electrs.sh [on|off|menu|update]"
- echo "installs the version $ELECTRSVERSION"
- exit 1
+  echo "config script to switch the Electrum Rust Server on or off"
+  echo "bonus.electrs.sh status -> dont call in loops"
+  echo "bonus.electrs.sh status-sync"
+  echo "bonus.electrs.sh [on|off|menu|update]"
+  echo "bonus.electrs.sh [install|uninstall]"
+  echo "installs the version $ELECTRSVERSION"
+  exit 1
 fi
 
 PGPsigner="romanz"
@@ -31,16 +32,20 @@ if [ "$1" = "status" ]; then
 
   if [ "${ElectRS}" = "on" ]; then
     echo "configured=1"
+    echo "installed=1"
   else
     echo "configured=0"
-  fi
-
-  serviceInstalled=$(sudo systemctl status electrs --no-page 2>/dev/null | grep -c "electrs.service - Electrs")
-  echo "serviceInstalled=${serviceInstalled}"
-  if [ ${serviceInstalled} -eq 0 ]; then
+    echo "installed=0"
     echo "infoSync='Service not installed'"
   fi
 
+  #if id "electrs" &>/dev/null; then
+  #  echo "installed=1"
+  #else
+  #  echo "installed=0"
+  #fi
+
+  serviceInstalled=$(sudo systemctl status electrs --no-page 2>/dev/null | grep -c "electrs.service - Electrs")
   serviceRunning=$(sudo systemctl status electrs --no-page 2>/dev/null | grep -c "active (running)")
   echo "serviceRunning=${serviceRunning}"
   if [ ${serviceRunning} -eq 1 ]; then
@@ -52,7 +57,10 @@ if [ "$1" = "status" ]; then
     localPortRunning=$(sudo netstat -an | grep -c '0.0.0.0:50001')
     echo "localTCPPortActive=${localPortRunning}"
 
-    publicPortRunning=$(nc -z -w6 ${publicip} 50001 2>/dev/null; echo $?)
+    publicPortRunning=$(
+      nc -z -w6 ${publicip} 50001 2>/dev/null
+      echo $?
+    )
     if [ "${publicPortRunning}" == "0" ]; then
       # OK looks good - but just means that something is answering on that port
       echo "publicTCPPortAnswering=1"
@@ -63,7 +71,10 @@ if [ "$1" = "status" ]; then
     echo "portSSL='50002'"
     localPortRunning=$(sudo netstat -an | grep -c '0.0.0.0:50002')
     echo "localHTTPPortActive=${localPortRunning}"
-    publicPortRunning=$(nc -z -w6 ${publicip} 50002 2>/dev/null; echo $?)
+    publicPortRunning=$(
+      nc -z -w6 ${publicip} 50002 2>/dev/null
+      echo $?
+    )
     if [ "${publicPortRunning}" == "0" ]; then
       # OK looks good - but just means that something is answering on that port
       echo "publicHTTPPortAnswering=1"
@@ -84,33 +95,17 @@ if [ "$1" = "status" ]; then
     # check Nginx
     nginxTest=$(sudo nginx -t 2>&1 | grep -c "test is successful")
     echo "nginxTest=$nginxTest"
-
   fi
 
+  exit 0
 fi
 
 # give sync-status (can be called regularly)
-if [ "$1" = "status-sync" ] || [ "$1" = "status" ]; then
+if [ "$1" = "status-sync" ]; then
 
   serviceRunning=$(sudo systemctl status electrs --no-page 2>/dev/null | grep -c "active (running)")
   echo "serviceRunning=${serviceRunning}"
   if [ ${serviceRunning} -eq 1 ]; then
-
-    # Experimental try to get sync Info (electrs debug info would need more details)
-    #source <(/home/admin/_cache.sh get btc_mainnet_blocks_headers)
-    #blockchainHeight="${btc_mainnet_blocks_headers}"
-    #lastBlockchainHeight=$(($blockchainHeight -1))
-    #syncedToBlock=$(sudo journalctl -u electrs --no-pager -n2000 | grep "height=" | tail -n1| cut -d= -f3)
-    #syncProgress=0
-    #if [ "${syncedToBlock}" != "" ] && [ "${blockchainHeight}" != "" ] && [ "${blockchainHeight}" != "0" ]; then
-    #  syncProgress="$(echo "$syncedToBlock" "$blockchainHeight" | awk '{printf "%.2f", $1 / $2 * 100}')"
-    #fi
-    #echo "syncProgress=${syncProgress}%"
-    #if [ "${syncedToBlock}" = "${blockchainHeight}" ] || [ "${syncedToBlock}" = "${lastBlockchainHeight}" ]; then
-    #  echo "tipSynced=1"
-    #else
-    #  echo "tipSynced=0"
-    #fi
 
     # check if initial sync was done, by setting a file as once electrs is the first time responding on port 50001
     electrumResponding=$(echo '{"jsonrpc":"2.0","method":"server.ping","params":[],"id":"electrs-check"}' | netcat -w 2 127.0.0.1 50001 | grep -c "result")
@@ -118,6 +113,27 @@ if [ "$1" = "status-sync" ] || [ "$1" = "status" ]; then
       electrumResponding=1
     fi
     echo "electrumResponding=${electrumResponding}"
+
+    blockheight=0
+    blockheightPercent=0
+    if [ ${electrumResponding} -eq 0 ]; then
+
+      # get the synced blockheight
+      syncedBlock=$(echo '{"id": 1, "method": "blockchain.headers.subscribe", "params": []}' | nc -w 20 -q 1 localhost 50001 | jq '.result.height')
+      if [ "$syncedBlock" -eq "$syncedBlock" ] 2>/dev/null; then
+        blockheight=${syncedBlock}
+
+        # calculate the progress
+        source <(/home/admin/_cache.sh get btc_mainnet_blocks_verified)
+        if [ "$btc_mainnet_blocks_verified" -eq "$btc_mainnet_blocks_verified" ] 2>/dev/null; then
+          blockheightPercent=$(echo "scale=2; $syncedBlock / $btc_mainnet_blocks_verified * 100" | bc)
+          blockheightPercent=$(printf "%.0f\n" $blockheightPercent)
+        fi
+
+      fi
+    fi
+    echo "blockheight='${blockheight}'"
+    echo "blockheightPercent='${blockheightPercent}'"
 
     fileFlagExists=$(sudo ls /mnt/hdd/app-storage/electrs/initial-sync.done 2>/dev/null | grep -c 'initial-sync.done')
     if [ ${fileFlagExists} -eq 0 ] && [ ${electrumResponding} -gt 0 ]; then
@@ -128,7 +144,11 @@ if [ "$1" = "status-sync" ] || [ "$1" = "status" ]; then
     fi
     if [ ${fileFlagExists} -eq 0 ]; then
       echo "initialSynced=0"
-      echo "infoSync='Building Index (please wait)'"
+      if [ "${blockheightPercent}" != "0" ]; then
+        echo "infoSync='Building Index ${blockheightPercent}% (please wait)'"
+      else
+        echo "infoSync='Building Index (please wait)'"
+      fi
     else
       echo "initialSynced=1"
     fi
@@ -148,7 +168,7 @@ if [ "$1" = "menu" ]; then
   echo "# collecting status info ... (please wait)"
   source <(sudo /home/admin/config.scripts/bonus.electrs.sh status showAddress)
 
-  if [ ${serviceInstalled} -eq 0 ]; then
+  if [ ${configured} -eq 0 ]; then
     echo "# FAIL not installed"
     exit 1
   fi
@@ -174,7 +194,7 @@ This can take multiple hours.
   fi
 
   if [ ${nginxTest} -eq 0 ]; then
-     dialog --title "Testing nginx.conf has failed" --msgbox "
+    dialog --title "Testing nginx.conf has failed" --msgbox "
 Nginx is in a failed state. Will attempt to fix.
 Try connecting via port 50002 or Tor again once finished.
 Check 'sudo nginx -t' for a detailed error message.
@@ -191,17 +211,17 @@ Check 'sudo nginx -t' for a detailed error message.
   fi
 
   # Options (available without TOR)
-  OPTIONS=( \
-        CONNECT "How to Connect" \
-        REINDEX "Delete&Rebuild Index" \
-        STATUS "ElectRS Status Info"
-	)
+  OPTIONS=(
+    CONNECT "How to Connect"
+    REINDEX "Delete&Rebuild Index"
+    STATUS "ElectRS Status Info"
+  )
 
   CHOICE=$(whiptail --clear --title "Electrum Rust Server" --menu "menu" 10 50 4 "${OPTIONS[@]}" 2>&1 >/dev/tty)
   clear
 
   case $CHOICE in
-    CONNECT)
+  CONNECT)
     echo "######## How to Connect to Electrum Rust Server #######"
     echo
     echo "Install the Electrum Wallet App on your laptop from:"
@@ -232,13 +252,13 @@ Check 'sudo nginx -t' for a detailed error message.
     read key
     sudo /home/admin/config.scripts/blitz.display.sh hide
     ;;
-    STATUS)
+  STATUS)
     sudo /home/admin/config.scripts/bonus.electrs.sh status
     echo
     echo "Press ENTER to get back to main menu."
     read key
     ;;
-    REINDEX)
+  REINDEX)
     echo "######## Delete/Rebuild Index ########"
     echo "# stopping service"
     sudo systemctl stop electrs
@@ -261,15 +281,14 @@ fi
 echo "# Making sure services are not running"
 sudo systemctl stop electrs 2>/dev/null
 
-# switch on
-if [ "$1" = "1" ] || [ "$1" = "on" ]; then
+# install
+if [ "$1" = "install" ]; then
   echo "# INSTALL ELECTRS"
 
-  isInstalled=$(sudo ls /etc/systemd/system/electrs.service 2>/dev/null | grep -c 'electrs.service')
-  if [ ${isInstalled} -eq 0 ]; then
-
-    # cleanup
-    sudo rm -f /home/electrs/.electrs/config.toml
+  if id "electrs" &>/dev/null; then
+    echo "# user electrs exists already (codebase is installed)"
+  else
+    echo "# Installing codebase"
 
     echo
     echo "# Creating the electrs user"
@@ -282,7 +301,7 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
     echo
     # https://github.com/romanz/electrs/blob/master/doc/usage.md#build-dependencies
     sudo -u electrs curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sudo -u electrs sh -s -- --default-toolchain none -y
-    sudo apt install -y clang cmake build-essential  # for building 'rust-rocksdb'
+    sudo apt install -y clang cmake build-essential # for building 'rust-rocksdb'
 
     echo
     echo "# Downloading and building electrs $ELECTRSVERSION. This will take ~40 minutes"
@@ -294,15 +313,44 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
 
     # verify
     sudo -u electrs /home/admin/config.scripts/blitz.git-verify.sh \
-     "${PGPsigner}" "${PGPpubkeyLink}" "${PGPpubkeyFingerprint}" || exit 1
+      "${PGPsigner}" "${PGPpubkeyLink}" "${PGPpubkeyFingerprint}" "${ELECTRSVERSION}" || exit 1
 
     # build
     sudo -u electrs /home/electrs/.cargo/bin/cargo build --locked --release || exit 1
+  fi
+  exit 0
+fi
 
-    echo
-    echo "# The electrs database will be built in /mnt/hdd/app-storage/electrs/db. Takes ~18 hours and ~50Gb diskspace"
-    echo
-    sudo mkdir /mnt/hdd/app-storage/electrs 2>/dev/null
+# switch on
+if [ "$1" = "1" ] || [ "$1" = "on" ]; then
+  echo "# ACTIVATING ELECTRS"
+
+  isInstalled=$(sudo ls /etc/systemd/system/electrs.service 2>/dev/null | grep -c 'electrs.service')
+  if [ ${isInstalled} -eq 0 ]; then
+
+    # cleanup
+    sudo rm -f /home/electrs/.electrs/config.toml
+
+    if id "electrs" &>/dev/null; then
+      echo "# user electrs exists already (codebase is installed)"
+    else
+      echo "# Installing codebase"
+      /home/admin/config.scripts/bonus.electrs.sh install
+      if [ $? -ne 0 ]; then
+        echo "Install failed .. removing again."
+        /home/admin/config.scripts/bonus.electrs.sh uninstall
+        exit 1
+      fi
+    fi
+
+    # check and create storage dir
+    if ! sudo ls /mnt/hdd/app-storage/electrs 2>/dev/null; then
+      sudo mkdir /mnt/hdd/app-storage/electrs
+      echo
+      echo "# The electrs database will be built in /mnt/hdd/app-storage/electrs/db. Takes ~18 hours and ~50Gb diskspace"
+      echo
+    fi
+    # always fix user id
     sudo chown -R electrs:electrs /mnt/hdd/app-storage/electrs
 
     echo
@@ -320,7 +368,6 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
     sudo -u electrs mkdir /home/electrs/.electrs 2>/dev/null
     echo "\
 log_filters = \"WARN\"
-timestamp = true
 jsonrpc_import = true
 index-batch-size = 10
 wait_duration_secs = 10
@@ -337,12 +384,11 @@ server_banner = \"Welcome to electrs $ELECTRSVERSION - the Electrum Rust Server 
     echo
     echo "# Checking for config.toml"
     echo
-    if [ ! -f "/home/electrs/.electrs/config.toml" ]
-        then
-            echo "Failed to create config.toml"
-            exit 1
-        else
-            echo "OK"
+    if [ ! -f "/home/electrs/.electrs/config.toml" ]; then
+      echo "Failed to create config.toml"
+      exit 1
+    else
+      echo "OK"
     fi
 
     echo
@@ -350,14 +396,14 @@ server_banner = \"Welcome to electrs $ELECTRSVERSION - the Electrum Rust Server 
     echo
     isElectrs=$(sudo cat /etc/nginx/nginx.conf 2>/dev/null | grep -c 'upstream electrs')
     if [ ${isElectrs} -gt 0 ]; then
-            echo "electrs is already configured with Nginx. To edit manually run \`sudo nano /etc/nginx/nginx.conf\`"
+      echo "electrs is already configured with Nginx. To edit manually run \`sudo nano /etc/nginx/nginx.conf\`"
 
     elif [ ${isElectrs} -eq 0 ]; then
 
-            isStream=$(sudo cat /etc/nginx/nginx.conf 2>/dev/null | grep -c 'stream {')
-            if [ ${isStream} -eq 0 ]; then
+      isStream=$(sudo cat /etc/nginx/nginx.conf 2>/dev/null | grep -c 'stream {')
+      if [ ${isStream} -eq 0 ]; then
 
-            echo "
+        echo "
 stream {
         upstream electrs {
                 server 127.0.0.1:50001;
@@ -374,9 +420,9 @@ stream {
         }
 }" | sudo tee -a /etc/nginx/nginx.conf
 
-            elif [ ${isStream} -eq 1 ]; then
-                    sudo truncate -s-2 /etc/nginx/nginx.conf
-                    echo "
+      elif [ ${isStream} -eq 1 ]; then
+        sudo truncate -s-2 /etc/nginx/nginx.conf
+        echo "
         upstream electrs {
                 server 127.0.0.1:50001;
         }
@@ -392,10 +438,10 @@ stream {
         }
 }" | sudo tee -a /etc/nginx/nginx.conf
 
-            elif [ ${isStream} -gt 1 ]; then
-                    echo " Too many \`stream\` commands in nginx.conf. Please edit manually: \`sudo nano /etc/nginx/nginx.conf\` and retry"
-                    exit 1
-            fi
+      elif [ ${isStream} -gt 1 ]; then
+        echo " Too many \`stream\` commands in nginx.conf. Please edit manually: \`sudo nano /etc/nginx/nginx.conf\` and retry"
+        exit 1
+      fi
     fi
 
     echo
@@ -449,7 +495,7 @@ WantedBy=multi-user.target
   fi
 
   # whitelist downloading to localhost from bitcoind
-  if ! sudo grep -Eq "^whitelist=download@127.0.0.1" /mnt/hdd/bitcoin/bitcoin.conf;then
+  if ! sudo grep -Eq "^whitelist=download@127.0.0.1" /mnt/hdd/bitcoin/bitcoin.conf; then
     echo "whitelist=download@127.0.0.1" | sudo tee -a /mnt/hdd/bitcoin/bitcoin.conf
     bitcoindRestart=yes
   fi
@@ -479,10 +525,24 @@ WantedBy=multi-user.target
   exit 0
 fi
 
+# uninstall
+if [ "$1" = "uninstall" ]; then
+  echo "# UNINSTALL ELECTRS"
+
+  if [ "${ElectRS}" = "on" ]; then
+    echo "# FAIL: First switch ElectRS off before uninstalling."
+    exit 1
+  fi
+
+  echo "# remove user and home directory"
+  sudo userdel -rf electrs
+  exit 0
+fi
+
 # switch off
 if [ "$1" = "0" ] || [ "$1" = "off" ]; then
 
-  echo "# REMOVING ELECTRS"
+  echo "# DEACTIVATING ELECTRS"
 
   # if second parameter is "deleteindex"
   if [ "$2" == "deleteindex" ]; then
@@ -514,13 +574,10 @@ if [ "$1" = "0" ] || [ "$1" = "off" ]; then
   sudo ufw delete allow 50001
   sudo ufw delete allow 50002
 
-  # delete user and home directory
-  sudo userdel -rf electrs
-
   # setting value in raspiblitz config
   /home/admin/config.scripts/blitz.conf.sh set ElectRS "off"
 
-  echo "# OK ElectRS removed."
+  echo "# OK ElectRS off."
   exit 0
 fi
 
@@ -530,7 +587,7 @@ if [ "$1" = "update" ]; then
   sudo -u electrs git fetch
 
   localVersion=$(/home/electrs/electrs/target/release/electrs --version)
-  updateVersion=$(curl --header "X-GitHub-Api-Version:2022-11-28" -s https://api.github.com/repos/romanz/electrs/releases/latest|grep tag_name|head -1|cut -d '"' -f4)
+  updateVersion=$(curl --header "X-GitHub-Api-Version:2022-11-28" -s https://api.github.com/repos/romanz/electrs/releases/latest | grep tag_name | head -1 | cut -d '"' -f4)
 
   if [ $localVersion = $updateVersion ]; then
     echo "# Up-to-date on version $localVersion"
@@ -541,11 +598,11 @@ if [ "$1" = "update" ]; then
     sudo -u electrs git reset --hard $updateVersion
 
     sudo -u electrs /home/admin/config.scripts/blitz.git-verify.sh \
-     "${PGPsigner}" "${PGPpubkeyLink}" "${PGPpubkeyFingerprint}" || exit 1
+      "${PGPsigner}" "${PGPpubkeyLink}" "${PGPpubkeyFingerprint}" "${updateVersion}" || exit 1
 
     echo "# Installing build dependencies"
     sudo -u electrs curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sudo -u electrs sh -s -- --default-toolchain none -y
-    sudo apt install -y clang cmake build-essential  # for building 'rust-rocksdb'
+    sudo apt install -y clang cmake build-essential # for building 'rust-rocksdb'
     echo
 
     echo "# Build Electrs ..."
@@ -554,6 +611,8 @@ if [ "$1" = "update" ]; then
     # update config
     sudo -u electrs sed -i "/^server_banner = /d" /home/electrs/.electrs/config.toml
     sudo -u electrs bash -c "echo 'server_banner = \"Welcome to electrs $updateVersion - the Electrum Rust Server on your RaspiBlitz\"' >> /home/electrs/.electrs/config.toml"
+    # remove the deprecated timestamp entry
+    sudo -u electrs sed -i '/^timestamp = true/d' /home/electrs/.electrs/config.toml
 
     echo "# Updated Electrs to $updateVersion"
   fi

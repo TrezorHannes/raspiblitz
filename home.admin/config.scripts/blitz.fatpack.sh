@@ -9,6 +9,23 @@ if [ "$EUID" -ne 0 ]
   exit 1
 fi
 
+# determine correct raspberrypi boot drive path (that easy to access when sd card is insert into laptop)
+raspi_bootdir=""
+if [ -d /boot/firmware ]; then
+  raspi_bootdir="/boot/firmware"
+elif [ -d /boot ]; then
+  raspi_bootdir="/boot"
+fi
+echo "# raspi_bootdir(${raspi_bootdir})"
+
+# determine if this is a early release candidate (use file not cache)
+codeVersion=$(git -C /home/admin/raspiblitz branch --show-current)
+isReleaseCandidate=0
+if [[ "$codeVersion" == *"dev"* ]]; then
+  isReleaseCandidate=1
+fi
+echo "# isReleaseCandidate(${isReleaseCandidate})"
+
 # make sure LCD is on (default for fatpack)
 /home/admin/config.scripts/blitz.display.sh set-display lcd
 
@@ -24,7 +41,7 @@ if [ "${needsExpansion}" == "1" ]; then
 
     # write a stop file to prevent full bootstrap
     # after fsexpand reboot
-    touch /boot/firmware/stop
+    touch ${raspi_bootdir}/stop
 
     # trigger fsexpand
     /home/admin/config.scripts/blitz.bootdrive.sh fsexpand
@@ -44,7 +61,7 @@ if [ "${needsExpansion}" == "1" ]; then
 fi
 
 apt_install() {
-  apt install -y ${@}
+  sudo DEBIAN_FRONTEND=noninteractive apt install -y ${@}
   if [ $? -eq 100 ]; then
     echo "FAIL! apt failed to install needed packages!"
     echo ${@}
@@ -62,12 +79,23 @@ echo "# defaultAPIuser(${defaultAPIuser})"
 echo "# defaultAPIrepo(${defaultAPIrepo})"
 echo "# defaultWEBUIuser(${defaultWEBUIuser})"
 echo "# defaultWEBUIrepo(${defaultWEBUIrepo})"
+sleep 3
+
+if [ "${defaultAPIuser}" == "" ] || [ "${defaultAPIrepo}" == "" ]; then
+  echo "FAIL: missing defaultAPIuser or defaultAPIrepo"
+  exit 1
+fi
+
+if [ "${defaultWEBUIuser}" == "" ] || [ "${defaultWEBUIrepo}" == "" ]; then
+  echo "FAIL: missing defaultWEBUIuser or defaultWEBUIrepo"
+  exit 1
+fi
 
 echo "* Adding nodeJS Framework ..."
 /home/admin/config.scripts/bonus.nodejs.sh on || exit 1
 
 echo "* Optional Packages (may be needed for extended features)"
-apt_install qrencode secure-delete fbi msmtp unclutter xterm python3-pyqt5 xfonts-terminus apache2-utils nginx python3-jinja2 socat libatlas-base-dev hexyl autossh
+apt_install qrencode secure-delete fbi msmtp unclutter xterm python3-pyqt5 xfonts-terminus python3-jinja2 socat libatlas-base-dev hexyl
 
 echo "* Adding LND ..."
 /home/admin/config.scripts/lnd.install.sh install || exit 1
@@ -82,10 +110,19 @@ sudo -u admin curl -H "Accept: application/json; indent=4" https://bitnodes.io/a
 # Fallback Nodes List from Bitcoin Core
 sudo -u admin curl https://raw.githubusercontent.com/bitcoin/bitcoin/master/contrib/seeds/nodes_main.txt -o /home/admin/fallback.bitcoin.nodes
 
-echo "* Adding Raspiblitz API ..."
-sudo /home/admin/config.scripts/blitz.web.api.sh on "${defaultAPIuser}" "${defaultAPIrepo}" "blitz-${branch}" || exit 1
-echo "* Adding Raspiblitz WebUI ..."
-sudo /home/admin/config.scripts/blitz.web.ui.sh on "${defaultWEBUIuser}" "${defaultWEBUIrepo}" "release/${branch}" || exit 1
+# use dev branch when its an Release Candidate
+if [ "${isReleaseCandidate}" == "1" ]; then
+  echo "# RELEASE CANDIDATE: using development branches for WebUI & API"
+  echo "* Adding Raspiblitz API (a)..."
+  sudo /home/admin/config.scripts/blitz.web.api.sh on "${defaultAPIuser}" "${defaultAPIrepo}" "dev" || exit 1
+  echo "* Adding Raspiblitz WebUI (a) ..."
+  sudo /home/admin/config.scripts/blitz.web.ui.sh on "${defaultWEBUIuser}" "${defaultWEBUIrepo}" "master" || exit 1
+else
+  echo "* Adding Raspiblitz API (b) ..."
+  sudo /home/admin/config.scripts/blitz.web.api.sh on "${defaultAPIuser}" "${defaultAPIrepo}" "blitz-${branch}" || exit 1
+  echo "* Adding Raspiblitz WebUI (b) ..."
+  sudo /home/admin/config.scripts/blitz.web.ui.sh on "${defaultWEBUIuser}" "${defaultWEBUIrepo}" "release/${branch}" || exit 1
+fi
 
 # set build code as new www default
 sudo rm -r /home/admin/assets/nginx/www_public
@@ -94,6 +131,8 @@ sudo cp -a /home/blitzapi/blitz_web/build/* /home/admin/assets/nginx/www_public
 sudo chown admin:admin /home/admin/assets/nginx/www_public
 sudo rm -r /home/blitzapi/blitz_web/build/*
 
+echo "* Adding Code&Compile for WEBUI-APP: ALBYHUB"
+/home/admin/config.scripts/bonus.albyhub.sh install || exit 1
 echo "* Adding Code&Compile for WEBUI-APP: LNBITS"
 /home/admin/config.scripts/bonus.lnbits.sh install || exit 1
 echo "* Adding Code&Compile for WEBUI-APP: JAM"
@@ -108,6 +147,5 @@ echo "* Adding Code&Compile for WEBUI-APP: BTC RPC EXPLORER"
 /home/admin/config.scripts/bonus.btc-rpc-explorer.sh install || exit 1
 echo "* Adding Code&Compile for WEBUI-APP: MEMPOOL"
 /home/admin/config.scripts/bonus.mempool.sh install || exit 1
-
-# set default display to LCD
-sudo /home/admin/config.scripts/blitz.display.sh set-display lcd
+echo "* Adding Code&Compile for WEBUI-APP: ELECTRS"
+/home/admin/config.scripts/bonus.electrs.sh install || exit 1

@@ -26,17 +26,15 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# install BTRFS if needed
-btrfsInstalled=$(btrfs --version 2>/dev/null | grep -c "btrfs-progs")
-if [ ${btrfsInstalled} -eq 0 ]; then
-  >&2 echo "# Installing BTRFS ..."
-  apt-get install -y btrfs-progs 1>/dev/null
+# determine correct raspberrypi boot drive path (that easy to access when sd card is insert into laptop)
+raspi_bootdir=""
+if [ -d /boot/firmware ]; then
+  raspi_bootdir="/boot/firmware"
+elif [ -d /boot ]; then
+  raspi_bootdir="/boot"
 fi
-btrfsInstalled=$(btrfs --version 2>/dev/null | grep -c "btrfs-progs")
-if [ ${btrfsInstalled} -eq 0 ]; then
-  echo "error='missing btrfs package'"
-  exit 1
-fi
+echo "# raspi_bootdir(${raspi_bootdir})"
+
 
 # install smartmontools if needed
 smartmontoolsInstalled=$(apt-cache policy smartmontools | grep -c 'Installed: (none)' | grep -c "0")
@@ -57,13 +55,40 @@ fi
 # gathering system info
 # is global so that also other parts of this script can use this
 
+# check if a btrfs filesystem is available
 # basics
 isMounted=$(df | grep -c /mnt/hdd)
-isBTRFS=$(btrfs filesystem show 2>/dev/null| grep -c 'BLITZSTORAGE')
-isRaid=$(btrfs filesystem df /mnt/hdd 2>/dev/null | grep -c "Data, RAID1")
-isZFS=$(zfs list 2>/dev/null | grep -c "/mnt/hdd")
+isBTRFS="0"
+isRaid="0"
+isZFS="0"
 isSSD="0"
 isSMART="0"
+
+# BTRFS extras
+btrfsConnected=$(lsblk -f | grep -c btrfs)
+if [ ${btrfsConnected} -gt 0 ]; then
+
+  # install BTRFS if needed
+  btrfsInstalled=$(btrfs --version 2>/dev/null | grep -c "btrfs-progs")
+  if [ ${btrfsInstalled} -eq 0 ]; then
+    >&2 echo "# Installing BTRFS ..."
+    apt-get install -y btrfs-progs 1>/dev/null
+  fi
+  btrfsInstalled=$(btrfs --version 2>/dev/null | grep -c "btrfs-progs")
+  if [ ${btrfsInstalled} -eq 0 ]; then
+    echo "error='missing btrfs package'"
+    exit 1
+  fi
+  isBTRFS=$(btrfs filesystem show 2>/dev/null| grep -c 'BLITZSTORAGE')
+  isRaid=$(btrfs filesystem df /mnt/hdd 2>/dev/null | grep -c "Data, RAID1")
+
+fi
+
+# ZFS extras
+zfsConnected=$(lsblk -f | grep -c zfs)
+if [ ${zfsConnected} -gt 0 ]; then
+  isZFS=$(zfs list 2>/dev/null | grep -c "/mnt/hdd")
+fi
 
 # determine if swap is external on or not
 externalSwapPath="/mnt/hdd/swapfile"
@@ -209,7 +234,7 @@ if [ "$1" = "status" ]; then
     fi
 
     # try to detect if its an SSD
-    isSMART=$(sudo smartctl -a /dev/${hdd} | grep -c "Serial Number:")
+    isSMART=$(smartctl -a /dev/${hdd} | grep -c "Serial Number:")
     echo "isSMART=${isSMART}"
     isSSD=1
     isRotational=$(echo "${smartCtlA}" | grep -c "Rotation Rate:")
@@ -221,21 +246,29 @@ if [ "$1" = "status" ]; then
     echo "hddTemperature="
     echo "hddTemperatureStr='?°C'"
 
-    # display results from hdd & partition detection
-    echo "hddCandidate='${hdd}'"
     hddBytes=0
     hddGigaBytes=0
     if [ "${hdd}" != "" ]; then
       hddBytes=$(fdisk -l /dev/$hdd | grep GiB | cut -d " " -f 5)
       if [ "${hddBytes}" = "" ]; then
-	hddBytes=$(fdisk -l /dev/$hdd | grep TiB | cut -d " " -f 5)
+	      hddBytes=$(fdisk -l /dev/$hdd | grep TiB | cut -d " " -f 5)
       fi
       hddGigaBytes=$(echo "scale=0; ${hddBytes}/1024/1024/1024" | bc -l)
     fi
+
+    # check if big enough
+    if [ ${hddGigaBytes} -lt 130 ]; then
+      echo "# Found HDD '${hdd}' is smaller than 130GB"
+      hdd=""
+      hddDataPartition=""
+    fi
+
+    # display results from hdd & partition detection
+    echo "hddCandidate='${hdd}'"
     echo "hddBytes=${hddBytes}"
     echo "hddGigaBytes=${hddGigaBytes}"
     echo "hddPartitionCandidate='${hddDataPartition}'"
-    
+
     # if positive deliver more data
     if [ ${#hddDataPartition} -gt 0 ]; then
       # check partition size in bytes and GBs
@@ -449,7 +482,7 @@ if [ "$1" = "status" ]; then
     fi
     echo "hddRaspiVersion='${hddRaspiVersion}'"
 
-    smartCtlA=$(sudo smartctl -a /dev/${hdd} | tr -d '"')
+    smartCtlA=$(smartctl -a /dev/${hdd} | tr -d '"')
 
     # try to detect if its an SSD
     isSMART=$(echo "${smartCtlA}" | grep -c "Serial Number:")
@@ -561,7 +594,7 @@ if [ "$1" = "status" ]; then
     hddAdapterUSAP=0
     
     # check if force UASP flag is set on sd card
-    if [ -f "/boot/firmware/uasp.force" ]; then
+    if [ -f "${raspi_bootdir}/uasp.force" ]; then
       hddAdapterUSAP=1
     fi
     # or UASP is set by config file
@@ -639,6 +672,8 @@ if [ "$1" = "format" ]; then
   # check valid format
   if [ "$2" = "btrfs" ]; then
     >&2 echo "# DATA DRIVE - FORMATTING to BTRFS layout (new)"
+    # check if btrfs-tools are installed
+    apt-get install -y btrfs-progs 1>/dev/null
   elif [ "$2" = "ext4" ]; then
     >&2 echo "# DATA DRIVE - FORMATTING to EXT4 layout (old)"
   else
@@ -1881,18 +1916,18 @@ if [ "$1" = "uasp-fix" ]; then
 
   # check if UASP is already deactivated (on RaspiOS)
   # https://www.pragmaticlinux.com/2021/03/fix-for-getting-your-ssd-working-via-usb-3-on-your-raspberry-pi/
-  cmdlineExists=$(ls /boot/cmdline.txt 2>/dev/null | grep -c "cmdline.txt")
+  cmdlineExists=$(ls ${raspi_bootdir}/cmdline.txt 2>/dev/null | grep -c "cmdline.txt")
   if [ ${cmdlineExists} -eq 1 ] && [ ${#hddAdapterUSB} -gt 0 ] && [ ${hddAdapterUSAP} -eq 0 ]; then
     echo "# Checking for UASP deactivation ..."
-    usbQuirkActive=$(cat /boot/cmdline.txt | grep -c "usb-storage.quirks=")
-    usbQuirkDone=$(cat /boot/cmdline.txt | grep -c "usb-storage.quirks=${hddAdapterUSB}:u")
+    usbQuirkActive=$(cat ${raspi_bootdir}/cmdline.txt | grep -c "usb-storage.quirks=")
+    usbQuirkDone=$(cat ${raspi_bootdir}/cmdline.txt | grep -c "usb-storage.quirks=${hddAdapterUSB}:u")
     if [ ${usbQuirkActive} -gt 0 ] && [ ${usbQuirkDone} -eq 0 ]; then
       # remove old usb-storage.quirks
-      sed -i "s/usb-storage.quirks=[^ ]* //g" /boot/cmdline.txt
+      sed -i "s/usb-storage.quirks=[^ ]* //g" ${raspi_bootdir}/cmdline.txt
     fi 
     if [ ${usbQuirkDone} -eq 0 ]; then
       # add new usb-storage.quirks
-      sed -i "s/^/usb-storage.quirks=${hddAdapterUSB}:u /" /boot/cmdline.txt
+      sed -i "s/^/usb-storage.quirks=${hddAdapterUSB}:u /" ${raspi_bootdir}/cmdline.txt
       # go into reboot to activate new setting
       echo "# DONE deactivating UASP for ${hddAdapterUSB} ... reboot needed"
       echo "neededReboot=1"

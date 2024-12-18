@@ -13,10 +13,20 @@ configFile="/mnt/hdd/raspiblitz.conf"
 # LOGS see: sudo journalctl -f -u background
 
 echo "_background.sh STARTED"
+echo "INFO: _background.sh loop started - sudo journalctl -f -u background" >> /home/admin/raspiblitz.log
 
 # global vars
 blitzTUIHeartBeatLine=""
 /home/admin/_cache.sh set blitzTUIRestarts "0"
+
+# determine correct raspberrypi boot drive path (that easy to access when sd card is insert into laptop)
+raspi_bootdir=""
+if [ -d /boot/firmware ]; then
+  raspi_bootdir="/boot/firmware"
+elif [ -d /boot ]; then
+  raspi_bootdir="/boot"
+fi
+echo "# raspi_bootdir(${raspi_bootdir})"
 
 counter=0
 while [ 1 ]
@@ -42,7 +52,6 @@ do
   # source info & config file fresh on every loop
   source ${infoFile} 2>/dev/null
   source ${configFile} 2>/dev/null
-  source <(/home/admin/_cache.sh get state setupPhase)
 
   ####################################################
   # SKIP BACKGROUND TASK LOOP ON CERTAIN SYSTEM STATES
@@ -104,8 +113,7 @@ do
 
     # detect a missing DHCP config
     if [ "${localip:0:4}" = "169." ]; then
-      echo "Missing DHCP detected ... trying emergency reboot"
-      /home/admin/config.scripts/blitz.shutdown.sh reboot
+      echo "Missing DHCP detected ..."
     else
       echo "DHCP OK"
     fi
@@ -189,6 +197,7 @@ do
 
       # only restart LND if auto-unlock is activated
       # AND neither the old nor the new IPv6 address is "::1"
+      source <(/home/admin/config.scripts/lnd.autounlock.sh status)
       if [ "${autoUnlock}" = "on" ]; then
         if [ "${publicIP_Old}" != "::1" ] && [ "${publicIP_New}" != "::1" ]; then
           echo "restart LND to pickup up new publicIP"
@@ -482,11 +491,35 @@ do
         echo "--> Channel Backup File changed"
 
         # make copy to sd card (as local basic backup)
-        mkdir -p /home/admin/backups/scb/ 2>/dev/null
+        mkdir -p ${localBackupDir} 2>/dev/null
         cp $scbPath $localBackupPath
+        if [ $? -eq 0 ]; then
+          echo "OK channel.backup copied to '${localBackupPath}'"
+        else
+          logger -p daemon.err "_background.sh FAIL channel.backup copy to '${localBackupPath}'"
+          echo "FAIL channel.backup copy to '${localBackupPath}'"
+        fi
+
         cp $scbPath $localTimestampedPath
-        cp $scbPath /boot/firmware/channel.backup
-        echo "OK channel.backup copied to '${localBackupPath}' and '${localTimestampedPath}' and '/boot/firmware/channel.backup'"
+        if [ $? -eq 0 ]; then
+          echo "OK channel.backup copied to '${localTimestampedPath}'"
+        else
+          logger -p daemon.err "_background.sh FAIL channel.backup copy to '${localTimestampedPath}'"
+          echo "FAIL channel.backup copy to '${localTimestampedPath}'"
+        fi
+
+        # copy to boot drive (for easy recovery)
+        if [ "${raspi_bootdir}" != "" ]; then
+          cp $scbPath ${raspi_bootdir}/channel.backup
+          if [ $? -eq 0 ]; then
+            echo "OK channel.backup copied to '${raspi_bootdir}/channel.backup'"
+          else
+            logger -p daemon.err "_background.sh FAIL channel.backup copy to '${raspi_bootdir}/channel.backup'"
+            echo "FAIL channel.backup copy to '${raspi_bootdir}/channel.backup'"
+          fi
+        else
+          echo "No boot drive found - skip copy to boot"
+        fi
 
         # check if a additional local backup target is set
         # see ./config.scripts/blitz.backupdevice.sh
@@ -591,8 +624,8 @@ do
         mkdir -p /home/admin/backups/er/ 2>/dev/null
         cp $erPath $localBackupPath
         cp $erPath $localTimestampedPath
-        cp $erPath /boot/firmware/${netprefix}emergency.recover
-        echo "OK emergency.recover copied to '${localBackupPath}' and '${localTimestampedPath}' and '/boot/firmware/${netprefix}emergency.recover'"
+        cp $erPath ${raspi_bootdir}/${netprefix}emergency.recover
+        echo "OK emergency.recover copied to '${localBackupPath}' and '${localTimestampedPath}' and '${raspi_bootdir}/${netprefix}emergency.recover'"
 
         # check if a additional local backup target is set
         # see ./config.scripts/blitz.backupdevice.sh
@@ -663,6 +696,18 @@ do
     fi
   fi
 
+  ###############################
+  # SSL CERT RENEWAL
+  ###############################
+  # check every 10min
+  recheckCert=$((($counter % 600)+1))
+  if [ ${recheckCert} -eq 10 ]; then
+
+    # TODO: check if letsencrypt certs are valid for more than 10 days & renew if not
+
+    # sets self-signed certs or letsencrypt certs (if valid) to nginx
+    sudo -u admin /home/admin/config.scripts/internet.letsencrypt.sh refresh-nginx-certs
+  fi
 
   ###############################
   # SUBSCRIPTION RENEWS
@@ -685,37 +730,13 @@ do
   if [ ${recheckRAID} -eq 1 ]; then
 
     # check if BTRTFS raid is active & scrub
+    logger -p info "background.sh - RAID data check"
     source <(/home/admin/config.scripts/blitz.datadrive.sh status)
     if [ "${isBTRFS}" == "1" ] && [ "${isRaid}" == "1" ]; then
       echo "STARTING BTRFS RAID DATA CHECK ..."
       btrfs scrub start /mnt/hdd/
     fi
 
-  fi
-
-  ###############################
-  # LND AUTO-UNLOCK
-  ###############################
-
-  # check every 10secs (only if LND is active)
-  recheckAutoUnlock=0
-  if [ "${lightning}" == "lnd" ] || [ "${lnd}" == "on" ]; then
-    recheckAutoUnlock=$((($counter % 10)+1))
-  fi
-  if [ ${recheckAutoUnlock} -eq 1 ]; then
-
-    # check if auto-unlock feature if activated
-    if [ "${autoUnlock}" = "on" ]; then
-
-      # check if lnd is locked
-      source <(/home/admin/config.scripts/lnd.unlock.sh status)
-      if [ "${locked}" != "0" ]; then
-
-        echo "STARTING AUTO-UNLOCK ..."
-        /home/admin/config.scripts/lnd.unlock.sh
-
-      fi
-    fi
   fi
 
   ###############################

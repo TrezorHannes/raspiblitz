@@ -1,5 +1,5 @@
-variable "iso_name" { default = "debian-12.5.0-amd64-netinst.iso" }
-variable "iso_checksum" { default = "013f5b44670d81280b5b1bc02455842b250df2f0c6763398feb69af1a805a14f" }
+variable "iso_name" { default = "debian-12.8.0-amd64-netinst.iso" }
+variable "iso_checksum" { default = "04396d12b0f377958a070c38a923c227832fa3b3e18ddc013936ecf492e9fbb3" }
 
 variable "pack" { default = "lean" }
 variable "github_user" { default = "raspiblitz" }
@@ -10,7 +10,7 @@ variable "boot" { default = "uefi" }
 variable "preseed_file" { default = "preseed.cfg" }
 variable "hostname" { default = "raspiblitz-amd64" }
 
-variable "disk_size" { default = "30000" }
+variable "disk_size" { default = "27000" }
 variable "memory" { default = "4096" }
 variable "cpus" { default = "4" }
 

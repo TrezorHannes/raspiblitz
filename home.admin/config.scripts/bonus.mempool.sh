@@ -2,7 +2,7 @@
 
 # https://github.com/mempool/mempool
 
-pinnedVersion="v2.5.0"
+pinnedVersion="v3.0.0"
 
 # command info
 if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "-help" ]; then
@@ -131,6 +131,10 @@ if [ "$1" = "install" ]; then
   # make sure needed os dependencies are installed
   sudo apt-get install -y mariadb-server mariadb-client
 
+  # stop mariadb - will be activated when switched "on"
+  sudo systemctl stop mariadb
+  sudo systemctl disable mariadb
+
   # add mempool user
   sudo adduser --system --group --home /home/mempool mempool
 
@@ -153,15 +157,18 @@ if [ "$1" = "install" ]; then
     exit 1
   fi
 
+  echo "# install Rust for mempool"
+  sudo -u mempool curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sudo -u mempool sh -s -- -y
+
   echo "# npm install for mempool explorer (backend)"
 
   cd ../backend/ || exit 1
-  if ! sudo -u mempool NG_CLI_ANALYTICS=false npm ci; then
+  if ! sudo -u mempool NG_CLI_ANALYTICS=false PATH=$PATH:/home/mempool/.cargo/bin npm ci; then
     echo "# FAIL - npm install did not run correctly, aborting"
     echo "result='failed npm install'"
     exit 1
   fi
-  if ! sudo -u mempool NG_CLI_ANALYTICS=false npm run build; then
+  if ! sudo -u mempool NG_CLI_ANALYTICS=false PATH=$PATH:/home/mempool/.cargo/bin npm run build; then
     echo "# FAIL - npm run build did not run correctly, aborting (2)"
     echo "result='failed npm run build'"
     exit 1
@@ -195,12 +202,25 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
   if [ "${isInstalled}" == "0" ]; then
     echo "# Install code base first ...."
     if ! /home/admin/config.scripts/bonus.mempool.sh install; then
+      /home/admin/config.scripts/bonus.mempool.sh uninstall 2>/dev/null
       echo "FAIL - install did not run correctly, aborting"
       exit 1
     fi
   fi
 
+  # check if /home/mempool/mempool exists
+  if [ ! -d "/home/mempool/mempool" ]; then
+    /home/admin/config.scripts/bonus.mempool.sh uninstall 2>/dev/null
+    echo "error='mempool code base install failed'"
+    echo "# please run manually first: /home/admin/config.scripts/bonus.mempool.sh install"
+    exit 1
+  fi
+
   echo "# *** Activate MEMPOOL ***"
+
+  # make sure mariadb is running
+  sudo systemctl enable mariadb 2>/dev/null
+  sudo systemctl start mariadb 2>/dev/null
 
   isActive=$(sudo ls /etc/systemd/system/mempool.service 2>/dev/null | grep -c 'mempool.service')
   if [ ${isActive} -eq 0 ]; then
@@ -222,6 +242,7 @@ if [ "$1" = "1" ] || [ "$1" = "on" ]; then
     RPC_USER=$(sudo cat /mnt/hdd/${network}/${network}.conf | grep rpcuser | cut -c 9-)
     PASSWORD_B=$(sudo cat /mnt/hdd/${network}/${network}.conf | grep rpcpassword | cut -c 13-)
 
+    sudo rm /var/cache/raspiblitz/mempool-config.json 2>/dev/null
     touch /var/cache/raspiblitz/mempool-config.json
     chmod 600 /var/cache/raspiblitz/mempool-config.json || exit 1
     cat >/var/cache/raspiblitz/mempool-config.json <<EOF
@@ -422,7 +443,7 @@ if [ "$1" = "update" ]; then
 
   cd /home/mempool/mempool || exit 1
 
-  localVersion=$(git describe --tag)
+  localVersion=$(sudo -u mempool git describe --tag)
   updateVersion=$(curl --header "X-GitHub-Api-Version:2022-11-28" -s https://api.github.com/repos/mempool/mempool/releases/latest | grep tag_name | head -1 | cut -d '"' -f4)
 
   if [ $localVersion = $updateVersion ]; then
@@ -438,12 +459,15 @@ if [ "$1" = "update" ]; then
 
     echo "# npm install for mempool explorer (backend)"
 
+    echo "# install Rust for mempool"
+    sudo -u mempool curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sudo -u mempool sh -s -- -y
+
     cd /home/mempool/mempool/backend/ || exit 1
-    if ! sudo -u mempool NG_CLI_ANALYTICS=false npm ci; then
+    if ! sudo -u mempool NG_CLI_ANALYTICS=false PATH=$PATH:/home/mempool/.cargo/bin npm ci; then
       echo "FAIL - npm install did not run correctly, aborting"
       exit 1
     fi
-    if ! sudo -u mempool NG_CLI_ANALYTICS=false npm run build; then
+    if ! sudo -u mempool NG_CLI_ANALYTICS=false PATH=$PATH:/home/mempool/.cargo/bin npm run build; then
       echo "FAIL - npm run build did not run correctly, aborting (3)"
       exit 1
     fi
@@ -470,17 +494,12 @@ if [ "$1" = "update" ]; then
 
     cd /home/mempool/mempool || exit 1
 
-    # Reinstall the mempool configuration for nginx
-    cp nginx.conf nginx-mempool.conf /etc/nginx/nginx.conf
-    sudo systemctl restart nginx
-
     # Remove useless deps
     echo "Removing unnecessary modules..."
-    npm prune --production
+    sudo -u mempool npm prune --production
 
     echo "***  Restarting Mempool  ***"
     sudo systemctl start mempool
-
   fi
 
   # check for error

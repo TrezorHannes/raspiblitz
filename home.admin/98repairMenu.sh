@@ -66,7 +66,7 @@ RaspiBlitz image to your SD card.
 }
 
 # get status of txindex
-source <(/home/admin/config.scripts/network.txindex.sh status)
+source <(sudo /home/admin/config.scripts/network.txindex.sh status)
 
 OPTIONS=()
 #OPTIONS+=(HARDWARE "Run Hardwaretest")
@@ -175,7 +175,6 @@ case $CHOICE in
     ;;
   COPY-SOURCE)
     /home/admin/config.scripts/blitz.copychain.sh source
-    /home/admin/config.scripts/lnd.unlock.sh
     ;;
 esac
 

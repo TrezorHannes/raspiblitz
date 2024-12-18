@@ -16,7 +16,7 @@ function help() {
 }
 
 # https://github.com/lightningd/plugins/commits/master/backup
-pinnedVersion="30003279e35e5931fc85d7e6211ea4de6f9554d7"
+pinnedVersion="46f28a88a2aa15c7c1b3c95a21dd99ea2195995e"
 
 # command info
 if [ $# -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "-help" ]; then
@@ -40,9 +40,11 @@ function install() {
   if [ $($lightningcli_alias plugin list 2>/dev/null | grep -c "/${plugin}") -eq 0 ]; then
     echo "# Checking dependencies"
     # upgrade pip
+    sudo pip3 config set global.break-system-packages true
     sudo pip3 install --upgrade pip
 
     # pip dependencies
+    sudo -u bitcoin pip3 config set global.break-system-packages true
     sudo -u bitcoin pip3 install pyln-client tqdm psutil
 
     # poetry
