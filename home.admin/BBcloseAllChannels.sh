@@ -48,11 +48,9 @@ elif [ $LNTYPE = lnd ];then
 
   # Set command based on user choice
   if [ "$close_type" = "COOP" ]; then
-    # command="$lncli_alias closeallchannels"
-    echo $lncli_alias closeallchannels
+    command="$lncli_alias closeallchannels"
   elif [ "$close_type" = "FORCE" ]; then
-    # command="$lncli_alias closeallchannels --force"
-    echo $lncli_alias closeallchannels --force
+    command="$lncli_alias closeallchannels --force"
   else
     echo "Invalid choice. Exiting."
     exit 1
@@ -105,7 +103,7 @@ echo "# RESULT:"
 if [ ${#command} -gt 0 ]; then
   if [ $LNTYPE = cl ];then
     cl_closeall
-  elif [ $LNTYPE = lnd ];then  
+  elif [ $LNTYPE = lnd ];then
     ${command}
   fi
 fi
