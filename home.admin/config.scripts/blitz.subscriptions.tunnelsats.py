@@ -1682,36 +1682,43 @@ def cmd_uninstall(deps, args, result):
                          "removal incomplete: %s; Lightning stays stopped, run REMOVE again" %
                          ", ".join(result.fields["remaining"]), EXIT_OPERATIONAL)
             return
-        if not (main_ok and other_ok):
-            actions, messages = [], []
-            if not main_ok:
-                then = None
-                if doc.get("ln_disabled"):
-                    then = "systemctl enable --now %s" % unit
-                    messages.append("%s stays stopped and disabled: its config is not Tor-only at rest" % unit)
-                elif doc.get("ln_was_active") and not doc.get("ln_started"):
-                    then = "systemctl start %s" % unit
-                    messages.append("%s stays stopped: its config is not Tor-only at rest" % unit)
-                else:
-                    messages.append("the config of %s is not Tor-only at rest" % unit)
-                actions.append(at_rest_action(unit_impl, main_doc, unit, then))
-            if not other_ok:
-                other_unit = UNITS[OTHER_IMPL[unit_impl]]
-                actions.append(at_rest_action(OTHER_IMPL[unit_impl], other_doc, other_unit, None))
+        other_action = None
+        if not other_ok:
+            # the other implementation's config is read-only for TunnelSats and never started by it
+            other_unit = UNITS[OTHER_IMPL[unit_impl]]
+            other_action = at_rest_action(OTHER_IMPL[unit_impl], other_doc, other_unit, None)
+        if not main_ok:
+            then = None
+            if doc.get("ln_disabled"):
+                then = "systemctl enable --now %s" % unit
+                messages = ["%s stays stopped and disabled: its config is not Tor-only at rest" % unit]
+            elif doc.get("ln_was_active") and not doc.get("ln_started"):
+                then = "systemctl start %s" % unit
+                messages = ["%s stays stopped: its config is not Tor-only at rest" % unit]
+            else:
+                messages = ["the config of %s is not Tor-only at rest" % unit]
+            actions = [at_rest_action(unit_impl, main_doc, unit, then)]
+            if other_action:
+                actions.append(other_action)
                 messages.append("the config of %s is not Tor-only at rest" % other_unit)
-            then = next((a["then"] for a in actions if a["then"]), None)
             result.fields["action_required"] = {
                 "reason": "node_config_clearnet" if any(a["lines"] for a in actions) else "node_config_unknown",
                 "detail": "; ".join(a["detail"] for a in actions),
                 "lines": [line for a in actions for line in a["lines"]],
                 "then": then}
-            if not main_ok:
-                keep_pending_removal(deps, unit, doc)
+            keep_pending_removal(deps, unit, doc)
             result.error("E_AT_REST_UNREPAIRABLE", "operational",
                          "%s. Remove the listed TunnelSats settings%s" % (
                              "; ".join(messages), ", then run: sudo %s" % then if then else ""), EXIT_OPERATIONAL)
             return
         leftovers, warnings = zero_artifacts(deps, impl)
+        if other_action:
+            result.fields["other_impl_lines"] = other_action["lines"]
+            warnings.insert(0, "%s was left as it is: its config is not Tor-only at rest (%s). TunnelSats never "
+                               "starts it; %s before you start it" % (
+                                   other_unit, other_action["detail"],
+                                   "remove these settings: %s" % "; ".join(other_action["lines"])
+                                   if other_action["lines"] else "check its config"))
         result.fields["artifacts"] = leftovers
         result.fields["warnings"] = warnings
         if leftovers:

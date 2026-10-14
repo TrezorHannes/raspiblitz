@@ -788,16 +788,47 @@ class TestRemove(ModuleTestCase):
         self.assertEqual((0, "clean", True), (doc["exit_code"], doc["at_rest"], doc["removed"]), doc)
         self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
 
-    def test_the_other_implementation_is_checked_and_never_edited(self):
+    def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
         self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))
         doc = self.run_verb("uninstall", "--yes")
-        self.assertEqual((1, "E_AT_REST_UNREPAIRABLE"), (doc["exit_code"], doc["errors"][0]["code"]))
+        self.assertEqual((0, True, "drift"), (doc["exit_code"], doc["removed"], doc["other_impl_at_rest"]), doc)
         # the tunneled unit itself is Tor-only at rest: it is enabled and started again
         self.assertTrue(doc["ln_reenabled"] and doc["ln_started"])
-        self.assertEqual(([line], None), (doc["action_required"]["lines"], doc["action_required"]["then"]))
-        self.assertIn("lightningd.service", doc["errors"][0]["message"])
+        self.assertNotIn("action_required", doc)
+        self.assertEqual([line], doc["other_impl_lines"])
+        self.assertIn("lightningd.service", doc["warnings"][0])
+        self.assertIn(line, doc["warnings"][0])
+        self.assertIn(line, mod.result_text(doc))
         self.assertEqual([], self.fake.calls_of(mod.ITS, "audit", "cl", "--repair"))
+        self.assertEqual([], [c for c in self.fake.calls if c[0] == "systemctl" and "lightningd.service" in c
+                              and c[1] in ("enable", "start", "restart")])
+
+    def test_purge_is_not_skipped_when_only_the_other_implementation_is_not_tor_only(self):
+        line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
+        self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))
+        doc = self.run_verb("uninstall", "--yes", "--purge")
+        self.assertEqual((0, True, True), (doc["exit_code"], doc["removed"], doc["purged"]), doc)
+        self.assertFalse(os.path.exists(self.path(mod.STATE_DIR)))
+
+    def test_an_other_implementation_audit_without_answer_is_a_warning(self):
+        self.fake.its["audit cl"] = (124, "")
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, []), (doc["exit_code"], doc["removed"], doc["other_impl_lines"]), doc)
+        self.assertIn("did not answer", doc["warnings"][0])
+
+    def test_both_configs_not_tor_only_keeps_lightning_stopped_and_names_both(self):
+        main = "/mnt/hdd/app-data/lnd/lnd.conf:8:externalhosts=de2.tunnelsats.com:24556"
+        other = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
+        self.fake.its["audit lnd --repair"] = (1, self.audit("unrepairable", "tor_inactive", [main], ["externalhosts"]))
+        self.fake.its["audit cl"] = (4, self.audit("drift", None, [other], ["bind-addr"]))
+        doc = self.run_verb("uninstall", "--yes", "--purge")
+        self.assert_stays_stopped(doc)
+        self.assertEqual(([main, other], "systemctl enable --now lnd.service"),
+                         (doc["action_required"]["lines"], doc["action_required"]["then"]))
+        self.assertIn("lightningd.service", doc["errors"][0]["message"])
+        self.assertFalse(doc["purged"])
+        self.assertTrue(os.path.exists(self.path(mod.CONF_FILE)))
 
     def test_the_unit_of_the_uninstall_document_decides_which_config_is_audited(self):
         uninstall = fixture_json("tool", "uninstall_disabled.json")
