@@ -23,16 +23,25 @@ TS_PIN_VERSION="3.2"
 # web-flow signed squash merge on Tunnelsats/tunnelsats main
 TS_PIN_COMMIT="db70fd85bfa51afde199bb1152e94a24734c04c3"
 TS_PIN_SHA256="0cb360ae4b26d6ba8bb79a7fb0e98bc251357b31b906857a31c35a1f89008d6e"
+TS_PIN_SIGNER="web-flow"
+TS_PIN_KEY_URL="https://github.com/web-flow.gpg"
+# issuer of the signature of the pinned commit
+TS_PIN_KEY_FPR="B5690EEEBB952194"
 TS_PIN_CONTRACT=1
 # sha256 of every tunnelsats.sh the guard runs: the current pin plus pins shipped in earlier
 # RaspiBlitz releases (a node keeps working until REPAIR installs the newer pinned tool)
 TS_ACCEPTED_SHA256=("${TS_PIN_SHA256}")
+TS_REPO_URL="https://github.com/Tunnelsats/tunnelsats.git"
 
 # Size cap of a verify document read by the guard
 ITS_DOC_MAX=262144
+# Size cap of any other tool document
+ITS_OUT_MAX=1048576
 # Characters a flag value may contain: no quote, backslash, dollar, hash or glob character
 ITS_VALUE_RE='^[A-Za-z0-9.:=/ -]*$'
 ITS_SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# What the tick unit runs (written into a unit file, so the production path)
+ITS_PROD_MODULE="/home/admin/config.scripts/blitz.subscriptions.tunnelsats.py"
 
 # Paths and commands. Values set before sourcing win (tests); main resets them when executed.
 its_init_paths() {
@@ -41,6 +50,7 @@ its_init_paths() {
     TS_RB_TOOL="${TS_RB_TOOL:-/usr/local/sbin/tunnelsats}"
     TS_RB_RUN_DIR="${TS_RB_RUN_DIR:-/run/tunnelsats}"
     TS_RB_APPDATA="${TS_RB_APPDATA:-/mnt/hdd/app-data}"
+    TS_RB_CUSTOM="${TS_RB_CUSTOM:-/mnt/hdd/app-data/custom-installs.sh}"
     TS_RB_SYSTEMCTL="${TS_RB_SYSTEMCTL:-systemctl}"
     TS_RB_VERIFY_TIMEOUT="${TS_RB_VERIFY_TIMEOUT:-30}"
     TS_RB_CLN_DIR="${TS_RB_CLN_DIR:-/home/bitcoin/.lightning}"
@@ -48,6 +58,8 @@ its_init_paths() {
     TS_RB_ROOT_UID="${TS_RB_ROOT_UID:-0}"
     TS_RB_HANDSHAKE_WAIT="${TS_RB_HANDSHAKE_WAIT:-20}"
     TS_RB_HANDSHAKE_POLL="${TS_RB_HANDSHAKE_POLL:-2}"
+    TS_RB_UNIT_DIR="${TS_RB_UNIT_DIR:-/etc/systemd/system}"
+    TS_RB_LOGGER="${TS_RB_LOGGER:-logger}"
 }
 its_init_paths
 
@@ -59,6 +71,14 @@ its_usage() {
 TunnelSats on RaspiBlitz (root only, except status)
   internet.tunnelsats.sh guard <lnd|cl> <mainnet|testnet|signet> [--dry-run] [--json]
   internet.tunnelsats.sh audit <lnd|cl> [--repair] [--json]
+  internet.tunnelsats.sh fetch [--offline] [--json]
+  internet.tunnelsats.sh install --impl <lnd|cl> [--json]
+  internet.tunnelsats.sh uninstall [--json]
+  internet.tunnelsats.sh verify [--no-probe] [--json]
+  internet.tunnelsats.sh detect [--json]
+  internet.tunnelsats.sh block-insert [--check] [--json] | block-remove [--json] | block-status [--json]
+  internet.tunnelsats.sh restore [--json]
+  internet.tunnelsats.sh tick-timer <on|off|status>
   internet.tunnelsats.sh status [--json]
 EOF
 }
@@ -1162,7 +1182,7 @@ its_guard_state() {
 its_cmd_status() {
     local json=0 a impl ts tor pin tool_inst="no" tool_hash="n/a" dev="no" managed="n/a" vrc="n/a"
     local verdict="n/a" emerg="n/a" vunit="n/a" host="n/a" vport="n/a" strays="" out rc
-    local g_lnd g_cl e_lnd e_cl
+    local g_lnd g_cl e_lnd e_cl rblock lrestore
     for a in "$@"; do
         case "$a" in
             --json) json=1 ;;
@@ -1214,17 +1234,19 @@ its_cmd_status() {
     its_conf_defines TUNNELSATS_LND_ARGS && strays+="TUNNELSATS_LND_ARGS,"
     its_conf_defines TUNNELSATS_CLN_ARGS && strays+="TUNNELSATS_CLN_ARGS,"
     strays="${strays%,}"
+    rblock=$(its_block_state_word)
+    lrestore=$(its_last_restore_word)
     if [[ "$json" -eq 1 ]]; then
         its_doc status 0 '[]' '{tunnelsats: $ts, tunnelsatsImpl: $impl, runBehindTor: $tor, pin: $pin,
             tool_installed: $ti, tool_hash: $th, dev_override: $dev, managed: $managed, verify_rc: $vrc,
             verdict: $verdict, emergency_block: $emerg, unit: $vunit, endpoint_host: $host, vpn_port: $vport,
             guard_lnd: $glnd, guard_lightningd: $gcl, env_lnd: $elnd, env_lightningd: $ecl,
-            stray_definitions: $strays, restore_block: "n/a", last_restore: "n/a"}' \
+            stray_definitions: $strays, restore_block: $rblock, last_restore: $lrestore}' \
             --arg ts "$ts" --arg impl "$impl" --arg tor "$tor" --arg pin "$pin" --arg ti "$tool_inst" \
             --arg th "$tool_hash" --arg dev "$dev" --arg managed "$managed" --arg vrc "$vrc" \
             --arg verdict "$verdict" --arg emerg "$emerg" --arg vunit "$vunit" --arg host "$host" \
             --arg vport "$vport" --arg glnd "$g_lnd" --arg gcl "$g_cl" --arg elnd "$e_lnd" \
-            --arg ecl "$e_cl" --arg strays "${strays:-none}"
+            --arg ecl "$e_cl" --arg strays "${strays:-none}" --arg rblock "$rblock" --arg lrestore "$lrestore"
         return 0
     fi
     echo "tunnelsats=${ts} tunnelsatsImpl=${impl} runBehindTor=${tor}"
@@ -1233,8 +1255,922 @@ its_cmd_status() {
     echo "endpoint_host=${host} vpn_port=${vport}"
     echo "guard_lnd=${g_lnd} guard_lightningd=${g_cl}"
     echo "env_lnd=${e_lnd} env_lightningd=${e_cl} stray_definitions=${strays:-none}"
-    echo "restore_block=n/a last_restore=n/a"
+    echo "restore_block=${rblock} last_restore=${lrestore}"
     return 0
+}
+
+# ---------------------------------------------------------------------------------------------
+# State directory, journal, documents of this script
+# ---------------------------------------------------------------------------------------------
+
+its_state_dir() {
+    printf '%s' "${TS_RB_APPDATA}/tunnelsats"
+}
+
+# Makes sure the state directory (root 0700) exists and, given $1, its subdirectory $1 (root 0700).
+its_state_subdir() {
+    local s="${TS_RB_APPDATA}/tunnelsats"
+    if [[ ! -d "$s" ]]; then
+        mkdir -m 0700 -- "$s" 2>/dev/null || return 1
+    fi
+    [[ -n "${1:-}" ]] || return 0
+    if [[ ! -d "${s}/$1" ]]; then
+        mkdir -m 0700 -- "${s}/$1" 2>/dev/null || return 1
+    fi
+    return 0
+}
+
+its_dist_file() {
+    printf '%s' "${TS_RB_APPDATA}/tunnelsats/dist/tunnelsats-${TS_PIN_VERSION}-${TS_PIN_COMMIT:0:12}.sh"
+}
+
+# Journal line with tag $1 (best effort).
+its_journal() {
+    "$TS_RB_LOGGER" -t "$1" -- "$2" >/dev/null 2>&1 || true
+}
+
+# Copies $1 to $2 atomically with mode $3 (temp file next to the target, fsync, rename).
+its_atomic_copy() {
+    local tmp
+    tmp=$(mktemp "${2%/*}/.${2##*/}.XXXXXX" 2>/dev/null) || return 1
+    if ! cp -- "$1" "$tmp" 2>/dev/null || ! chmod "$3" -- "$tmp" 2>/dev/null || ! sync -- "$tmp" 2>/dev/null || \
+        ! mv -fT -- "$tmp" "$2" 2>/dev/null; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    return 0
+}
+
+# Prints a failure document of this script: $1 verb, $2 exit code, $3 code, $4 class, $5 message.
+its_fail_doc() {
+    its_doc "$1" "$2" "$(its_err "$3" "$4" "$5")" '{}'
+    its_log "# ${1}: ${3}: ${5}"
+}
+
+its_require_root() {
+    its_is_root && return 0
+    its_fail_doc "$1" 2 E_NOT_ROOT usage "${1} must run as root"
+    return 1
+}
+
+# Succeeds if the stored WireGuard config is a regular root 0600 file with PrivateKey and Endpoint.
+its_stored_conf_ok() {
+    local f="$1" st
+    [[ -f "$f" ]] && [[ ! -L "$f" ]] || return 1
+    st=$(stat -c '%u %a' -- "$f" 2>/dev/null) || return 1
+    [[ "$st" == "${TS_RB_ROOT_UID} 600" ]] || return 1
+    grep -Eq '^[[:space:]]*PrivateKey[[:space:]]*=' "$f" && grep -Eq '^[[:space:]]*Endpoint[[:space:]]*=' "$f"
+}
+
+# ---------------------------------------------------------------------------------------------
+# fetch [--offline] [--json]: the pinned tunnelsats.sh (commit, web-flow signature, sha256)
+# ---------------------------------------------------------------------------------------------
+
+its_fetch_reset() {
+    F_PATH="" F_ACTUAL="" F_SIG="not_checked" F_SOURCE="$1" F_CODE="" F_CLASS="operational" F_MSG=""
+}
+
+its_fetch_fail() {
+    F_CODE="$1"
+    F_CLASS="$2"
+    F_MSG="$3"
+}
+
+# The stored copy, no network: used only if its sha256 equals the pin (it was verified when it was
+# stored); a copy that does not is deleted. Returns 0, 3 (not fetched yet) or 1 (hash mismatch).
+its_fetch_offline() {
+    local f sha
+    its_fetch_reset stored
+    f="$(its_dist_file)"
+    if [[ -L "$f" ]] || [[ ! -f "$f" ]]; then
+        its_fetch_fail E_NOT_FETCHED not_configured "no stored copy of tunnelsats.sh ${TS_PIN_VERSION} (run fetch)"
+        return 3
+    fi
+    sha=$(sha256sum -- "$f" 2>/dev/null) || sha=""
+    F_ACTUAL="${sha%% *}"
+    if [[ "$F_ACTUAL" != "$TS_PIN_SHA256" ]]; then
+        rm -f -- "$f"
+        its_fetch_fail E_HASH_MISMATCH integrity "the stored copy does not match the pinned sha256 and was deleted"
+        return 1
+    fi
+    F_PATH="$f"
+    F_SIG="stored"
+    return 0
+}
+
+# git for the download: clean environment (no user or system config, no prompts), time limit.
+its_git() {
+    env -i PATH="$ITS_SAFE_PATH" HOME="$F_HOME" LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 \
+        timeout 120 git "$@" </dev/null >/dev/null 2>&1
+}
+
+# Downloads exactly the pinned commit (shallow, sparse, one blob), then checks the commit id, the
+# web-flow signature (blitz.git-verify.sh, commit mode), the sha256 and the VERSION and TS_CONTRACT
+# lines, and stores the copy atomically (root 0644 in the root 0700 state directory). Never a
+# branch, never an unpinned file.
+its_fetch_online() {
+    local d repo head sha f old
+    its_fetch_reset network
+    if ! its_run_dir_ok || ! its_state_subdir dist || ! d=$(mktemp -d "${TS_RB_RUN_DIR}/.fetch.XXXXXX" 2>/dev/null); then
+        its_fetch_fail E_DOWNLOAD_FAILED operational "the run or state directory cannot be used"
+        return 1
+    fi
+    ITS_TMPDIRS+=("$d")
+    repo="${d}/repo"
+    F_HOME="${d}/home"
+    mkdir -p -- "$repo" "$F_HOME"
+    if ! its_git -C "$repo" init -q || ! its_git -C "$repo" remote add origin "$TS_REPO_URL" || \
+        ! its_git -C "$repo" config remote.origin.promisor true || \
+        ! its_git -C "$repo" config remote.origin.partialclonefilter blob:none || \
+        ! its_git -C "$repo" sparse-checkout set --no-cone /scripts/tunnelsats.sh || \
+        ! its_git -C "$repo" fetch -q --depth 1 --filter=blob:none origin "$TS_PIN_COMMIT" || \
+        ! its_git -C "$repo" checkout -q --detach FETCH_HEAD; then
+        its_fetch_fail E_DOWNLOAD_FAILED operational "downloading commit ${TS_PIN_COMMIT:0:12} failed"
+        return 1
+    fi
+    head=$(env -i PATH="$ITS_SAFE_PATH" HOME="$F_HOME" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 git -C "$repo" rev-parse HEAD 2>/dev/null) || head=""
+    if [[ "$head" != "$TS_PIN_COMMIT" ]]; then
+        its_fetch_fail E_PIN_MISMATCH integrity "the downloaded commit is not the pinned one"
+        return 1
+    fi
+    if ! (cd "$repo" && "${TS_RB_ROOT}/config.scripts/blitz.git-verify.sh" "$TS_PIN_SIGNER" "$TS_PIN_KEY_URL" "$TS_PIN_KEY_FPR") >&2 </dev/null; then
+        F_SIG="bad"
+        its_fetch_fail E_SIGNATURE integrity "the signature of the pinned commit could not be verified (signer ${TS_PIN_SIGNER}, key ${TS_PIN_KEY_FPR})"
+        return 1
+    fi
+    F_SIG="good"
+    sha=$(sha256sum -- "${repo}/scripts/tunnelsats.sh" 2>/dev/null) || sha=""
+    F_ACTUAL="${sha%% *}"
+    if [[ "$F_ACTUAL" != "$TS_PIN_SHA256" ]]; then
+        its_fetch_fail E_HASH_MISMATCH integrity "scripts/tunnelsats.sh does not match the pinned sha256"
+        return 1
+    fi
+    if ! grep -qxF "VERSION=\"${TS_PIN_VERSION}\"" "${repo}/scripts/tunnelsats.sh" || \
+        ! grep -qxF "TS_CONTRACT=${TS_PIN_CONTRACT}" "${repo}/scripts/tunnelsats.sh"; then
+        its_fetch_fail E_CONTRACT integrity "the VERSION or TS_CONTRACT line differs from the pin"
+        return 1
+    fi
+    f="$(its_dist_file)"
+    if ! its_atomic_copy "${repo}/scripts/tunnelsats.sh" "$f" 0644; then
+        its_fetch_fail E_WRITE_FAILED operational "the verified copy could not be stored"
+        return 1
+    fi
+    for old in "${f%/*}"/tunnelsats-*.sh; do
+        if [[ -e "$old" ]] && [[ "$old" != "$f" ]]; then
+            rm -f -- "$old"
+        fi
+    done
+    F_PATH="$f"
+    return 0
+}
+
+# fetch --dev-override FILE --dev-sha256 HEX (development only, absent from menus and provisioning):
+# a root-owned file with an explicitly given sha256, stored as dist/dev-override.sh. The guard
+# accepts that hash for this boot only (run directory); restore and REPAIR keep using the pin.
+its_fetch_dev() {
+    local src="$1" want="$2" st sha f
+    its_fetch_reset dev_override
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]] || [[ -L "$src" ]] || [[ ! -f "$src" ]]; then
+        its_fetch_fail E_USAGE usage "--dev-override needs a regular file and --dev-sha256 with 64 hex digits"
+        return 2
+    fi
+    st=$(stat -c '%u %a' -- "$src" 2>/dev/null) || st="none 777"
+    if [[ "${st%% *}" != "$TS_RB_ROOT_UID" ]] || (( (8#${st##* } & 8#022) != 0 )); then
+        its_fetch_fail E_DEV_OVERRIDE refused "the override file must be owned by root and not writable by others"
+        return 1
+    fi
+    sha=$(sha256sum -- "$src" 2>/dev/null) || sha=""
+    F_ACTUAL="${sha%% *}"
+    if [[ "$F_ACTUAL" != "$want" ]]; then
+        its_fetch_fail E_HASH_MISMATCH integrity "the override file does not match --dev-sha256"
+        return 1
+    fi
+    f="${TS_RB_APPDATA}/tunnelsats/dist/dev-override.sh"
+    if ! its_state_subdir dist || ! its_run_dir_ok || ! its_atomic_copy "$src" "$f" 0644 || \
+        ! its_atomic_write "${TS_RB_RUN_DIR}/dev-override.sha256" "${want}"$'\n' 0644; then
+        its_fetch_fail E_WRITE_FAILED operational "the override could not be stored"
+        return 1
+    fi
+    F_PATH="$f"
+    its_journal tunnelsats "DEV OVERRIDE: tunnelsats.sh with sha256 ${want} accepted until the next boot"
+    its_log "# DEV OVERRIDE registered for this boot (sha256 ${want}); restore and REPAIR keep using the pin"
+    return 0
+}
+
+its_fetch_doc() {
+    local rc="$1" errors="[]"
+    [[ -n "$F_CODE" ]] && errors=$(its_err "$F_CODE" "$F_CLASS" "$F_MSG")
+    its_doc fetch "$rc" "$errors" '{pinned_version: $pv, pinned_commit: $pc, pinned_sha256: $ps,
+        actual_sha256: ($actual | if . == "" then null else . end),
+        signature: {result: $sig, signer: $signer, fingerprint: $fpr},
+        source: $src, path: ($path | if . == "" then null else . end),
+        error: ($code | if . == "" then null else . end)}' \
+        --arg pv "$TS_PIN_VERSION" --arg pc "$TS_PIN_COMMIT" --arg ps "$TS_PIN_SHA256" --arg actual "$F_ACTUAL" \
+        --arg sig "$F_SIG" --arg signer "$TS_PIN_SIGNER" --arg fpr "$TS_PIN_KEY_FPR" --arg src "$F_SOURCE" \
+        --arg path "$F_PATH" --arg code "$F_CODE"
+}
+
+its_cmd_fetch() {
+    local offline=0 json=0 dev_file="" dev_sha="" rc
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --offline) offline=1 ;;
+            --json) json=1 ;;
+            --dev-override) dev_file="${2:-}"; shift ;;
+            --dev-sha256) dev_sha="${2:-}"; shift ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+        shift
+    done
+    its_require_root fetch || return 2
+    if [[ -n "$dev_file" ]] || [[ -n "$dev_sha" ]]; then
+        its_fetch_dev "$dev_file" "$dev_sha"
+    elif [[ "$offline" -eq 1 ]]; then
+        its_fetch_offline
+    else
+        its_fetch_online
+    fi
+    rc=$?
+    its_cleanup
+    if [[ "$json" -eq 1 ]]; then
+        its_fetch_doc "$rc"
+    elif [[ "$rc" -eq 0 ]]; then
+        echo "# fetch: ok (${F_SOURCE}, signature ${F_SIG}): ${F_PATH}"
+    else
+        echo "# fetch: ${F_CODE}: ${F_MSG}"
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Contract calls to the pinned tool: install, uninstall, verify, detect (cl becomes cln only here)
+# ---------------------------------------------------------------------------------------------
+
+# Runs script $1 (it must hash to $2) from a private root 0700 copy, with timeout $3 seconds, in a
+# clean environment with stdin /dev/null; arguments $4... Sets X_RC and X_DOC (stdout, capped);
+# stderr (progress) passes through.
+its_tool_run() {
+    local src="$1" sha="$2" t="$3" dir copy got
+    shift 3
+    X_RC=1
+    X_DOC=""
+    dir=$(mktemp -d "$(its_tmp_base)/.run.XXXXXX" 2>/dev/null) || return 1
+    ITS_TMPDIRS+=("$dir")
+    copy="${dir}/tunnelsats.sh"
+    cp -- "$src" "$copy" 2>/dev/null || return 1
+    got=$(sha256sum -- "$copy" 2>/dev/null) || return 1
+    [[ "${got%% *}" == "$sha" ]] || return 1
+    env -i PATH="$ITS_SAFE_PATH" LC_ALL=C.UTF-8 timeout --kill-after=10 "$t" bash "$copy" "$@" </dev/null |
+        head -c "$ITS_OUT_MAX" > "${dir}/out"
+    X_RC="${PIPESTATUS[0]}"
+    X_DOC="${dir}/out"
+    return 0
+}
+
+# Prints the tool's document unchanged and returns its exit code. A timeout, a missing or broken
+# document or another contract becomes a document of this script ($1 = verb).
+its_pass_through() {
+    local verb="$1" contract
+    if [[ "$X_RC" == 124 ]] || [[ "$X_RC" == 137 ]]; then
+        its_fail_doc "$verb" 1 E_TIMEOUT operational "tunnelsats.sh ${verb} did not finish in time"
+        return 1
+    fi
+    contract=$(jq -r -s 'if length == 1 and (.[0] | type) == "object" then (.[0].contract | tostring) else "invalid" end' \
+        "$X_DOC" 2>/dev/null) || contract="invalid"
+    if [[ "$contract" == invalid ]]; then
+        its_fail_doc "$verb" 1 E_TOOL_OUTPUT operational "tunnelsats.sh ${verb} printed no single JSON document (exit ${X_RC})"
+        return 1
+    fi
+    if [[ "$contract" != "$TS_PIN_CONTRACT" ]]; then
+        its_fail_doc "$verb" 1 E_CONTRACT integrity "tunnelsats.sh speaks contract ${contract:0:16}, RaspiBlitz pins ${TS_PIN_CONTRACT}"
+        return 1
+    fi
+    cat -- "$X_DOC"
+    return "$X_RC"
+}
+
+# Runs the tool and prints its document (json $1 = 1) or its plain output. $2 verb, $3 script,
+# $4 sha256, $5 timeout, then the tool's arguments.
+its_tool_out() {
+    local json="$1" verb="$2" src="$3" sha="$4" t="$5" rc
+    shift 5
+    [[ "$json" -eq 1 ]] && set -- "$@" --json
+    if ! its_tool_run "$src" "$sha" "$t" "$@"; then
+        its_fail_doc "$verb" 1 E_TOOL_COPY operational "the verified tunnelsats.sh could not be prepared for ${verb}"
+        its_cleanup
+        return 1
+    fi
+    if [[ "$json" -eq 1 ]]; then
+        its_pass_through "$verb"
+        rc=$?
+    else
+        cat -- "$X_DOC"
+        rc="$X_RC"
+    fi
+    its_cleanup
+    return "$rc"
+}
+
+# install --impl <lnd|cl> [--json]: the verified stored copy runs install --managed raspiblitz.
+its_cmd_install() {
+    local impl="" cimpl json=0 dev=0 conf src sha rc
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --impl) impl="${2:-}"; shift ;;
+            --json) json=1 ;;
+            --dev-override) dev=1 ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+        shift
+    done
+    case "$impl" in
+        lnd) cimpl="lnd" ;;
+        cl) cimpl="cln" ;;
+        *) its_fail_doc install 2 E_USAGE usage "install needs --impl lnd or --impl cl"; return 2 ;;
+    esac
+    its_require_root install || return 2
+    its_run_dir_ok || true
+    conf="$(its_state_dir)/tunnelsats.conf"
+    if ! its_stored_conf_ok "$conf"; then
+        its_fail_doc install 3 E_NOT_CONFIGURED not_configured "no stored TunnelSats config (root 0600 with PrivateKey and Endpoint)"
+        return 3
+    fi
+    if [[ "$dev" -eq 1 ]]; then
+        src="$(its_state_dir)/dist/dev-override.sh"
+        sha=$(its_dev_override_sha)
+        if [[ -z "$sha" ]] || [[ ! -f "$src" ]]; then
+            its_fail_doc install 1 E_DEV_OVERRIDE refused "no development override registered for this boot"
+            return 1
+        fi
+    else
+        its_fetch_offline
+        rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            its_fail_doc install "$rc" "$F_CODE" "$F_CLASS" "$F_MSG"
+            return "$rc"
+        fi
+        src="$F_PATH"
+        sha="$TS_PIN_SHA256"
+    fi
+    its_tool_out "$json" install "$src" "$sha" 900 install --managed raspiblitz --impl "$cimpl" --network mainnet \
+        --config "$conf" --non-interactive --yes
+}
+
+# Selects the installed tool when it is trusted, else the verified stored copy. Sets S_SRC, S_SHA.
+its_select_tool() {
+    if its_tool_trust; then
+        S_SRC="$TS_RB_TOOL"
+        S_SHA="$T_SHA"
+        return 0
+    fi
+    its_fetch_offline || return $?
+    S_SRC="$F_PATH"
+    S_SHA="$TS_PIN_SHA256"
+    return 0
+}
+
+# uninstall [--json]: uninstall --managed with the installed tool if trusted, else the stored copy.
+its_cmd_uninstall() {
+    local json=0 a rc
+    for a in "$@"; do
+        case "$a" in
+            --json) json=1 ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+    done
+    its_require_root uninstall || return 2
+    its_select_tool
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        its_fail_doc uninstall "$rc" "$F_CODE" "$F_CLASS" "$F_MSG"
+        return "$rc"
+    fi
+    its_tool_out "$json" uninstall "$S_SRC" "$S_SHA" 600 uninstall --managed --non-interactive --yes
+}
+
+# verify [--no-probe] [--json]: the installed tool after the trust check; without an install the
+# stored copy (it answers not installed or unmanaged). An untrusted installed tool is refused.
+its_cmd_verify() {
+    local json=0 t=120 a rc
+    local -a args=(verify)
+    for a in "$@"; do
+        case "$a" in
+            --json) json=1 ;;
+            --no-probe) args+=(--no-probe); t=35 ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+    done
+    its_require_root verify || return 2
+    its_tool_trust
+    rc=$?
+    if [[ "$rc" -eq 4 ]]; then
+        its_fail_doc verify 1 E_TOOL_UNTRUSTED integrity "the installed tunnelsats tool is not a pinned version (REPAIR installs the pinned one)"
+        return 1
+    fi
+    its_select_tool
+    rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        its_fail_doc verify "$rc" "$F_CODE" "$F_CLASS" "$F_MSG"
+        return "$rc"
+    fi
+    its_tool_out "$json" verify "$S_SRC" "$S_SHA" "$t" "${args[@]}"
+}
+
+# detect [--json]: read-only, the verified stored copy (fetched first if needed).
+its_cmd_detect() {
+    local json=0 a
+    for a in "$@"; do
+        case "$a" in
+            --json) json=1 ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+    done
+    its_require_root detect || return 2
+    if ! its_fetch_offline && ! its_fetch_online; then
+        its_cleanup
+        its_fail_doc detect 1 "$F_CODE" "$F_CLASS" "$F_MSG"
+        return 1
+    fi
+    its_tool_out "$json" detect "$F_PATH" "$TS_PIN_SHA256" 120 detect
+}
+
+# ---------------------------------------------------------------------------------------------
+# The marked block in custom-installs.sh (restore after an SD-card update)
+# ---------------------------------------------------------------------------------------------
+
+ITS_BLOCK_BEGIN="# >>> TunnelSats block (managed by internet.tunnelsats.sh, do not edit) >>>"
+ITS_BLOCK_END="# <<< TunnelSats block <<<"
+
+# The block, POSIX sh, no exit, every command inside if or ||: a set -e in the user's file cannot
+# stop at the block and the block cannot end the file early.
+its_block_text() {
+    cat <<'EOF'
+# >>> TunnelSats block (managed by internet.tunnelsats.sh, do not edit) >>>
+# Restores the TunnelSats tunnel after an SD-card update; Lightning stays Tor-only until it is back.
+if [ -x /home/admin/config.scripts/internet.tunnelsats.sh ]; then
+  /home/admin/config.scripts/internet.tunnelsats.sh restore || echo "# TunnelSats: restore failed (exit $?); Lightning stays Tor-only. SSH menu > SUBSCRIBE > TunnelSats > REPAIR"
+else
+  echo "# TunnelSats: this RaspiBlitz image has no TunnelSats integration; Lightning stays Tor-only"
+fi
+# <<< TunnelSats block <<<
+EOF
+}
+
+# Succeeds if custom-installs file $1 may be read and rewritten: a regular file (not a symlink), at
+# most 1 MiB, no NUL bytes. Sets B_CODE/B_MSG otherwise.
+its_custom_file_ok() {
+    local f="$1" size n
+    B_CODE="" B_MSG=""
+    if [[ -L "$f" ]] || [[ ! -f "$f" ]]; then
+        B_CODE="E_CUSTOM_INSTALLS_UNSAFE"; B_MSG="${f} is not a regular file"
+        return 1
+    fi
+    size=$(stat -c %s -- "$f" 2>/dev/null) || size=-1
+    if [[ "$size" -lt 0 ]] || [[ "$size" -gt 1048576 ]]; then
+        B_CODE="E_CUSTOM_INSTALLS_UNSAFE"; B_MSG="${f} cannot be read or is larger than 1 MiB"
+        return 1
+    fi
+    n=$(tr -d '\000' < "$f" 2>/dev/null | wc -c) || n=-1
+    if [[ "$n" != "$size" ]]; then
+        B_CODE="E_CUSTOM_INSTALLS_UNSAFE"; B_MSG="${f} holds NUL bytes"
+        return 1
+    fi
+    return 0
+}
+
+# Scans file $1 for the markers (whole lines, a trailing CR ignored for the comparison). Sets
+# B_STATE (absent, present, malformed), B_BEGIN and B_END (line numbers) and B_MARKERS.
+its_block_scan() {
+    local f="$1" i line nb=0 ne=0
+    local -a lines=()
+    B_STATE="absent" B_BEGIN=0 B_END=0 B_MARKERS=()
+    mapfile -t lines < "$f" || return 1
+    for i in "${!lines[@]}"; do
+        line="${lines[i]%$'\r'}"
+        if [[ "$line" == "$ITS_BLOCK_BEGIN" ]]; then
+            nb=$((nb + 1)); B_BEGIN=$((i + 1)); B_MARKERS+=("$((i + 1))")
+        elif [[ "$line" == "$ITS_BLOCK_END" ]]; then
+            ne=$((ne + 1)); B_END=$((i + 1)); B_MARKERS+=("$((i + 1))")
+        fi
+    done
+    if [[ "$nb" -eq 0 ]] && [[ "$ne" -eq 0 ]]; then
+        B_STATE="absent"
+    elif [[ "$nb" -eq 1 ]] && [[ "$ne" -eq 1 ]] && [[ "$B_BEGIN" -lt "$B_END" ]]; then
+        B_STATE="present"
+    else
+        B_STATE="malformed"
+    fi
+    return 0
+}
+
+its_block_state_word() {
+    if [[ ! -e "$TS_RB_CUSTOM" ]] && [[ ! -L "$TS_RB_CUSTOM" ]]; then
+        printf 'absent'
+    elif its_custom_file_ok "$TS_RB_CUSTOM" && its_block_scan "$TS_RB_CUSTOM"; then
+        printf '%s' "$B_STATE"
+    else
+        printf 'invalid'
+    fi
+}
+
+# Prints <result>@<at> of the last provisioning restore, none, or n/a without root.
+its_last_restore_word() {
+    local f="${TS_RB_APPDATA}/tunnelsats/last-restore.json" out
+    if ! its_is_root; then
+        printf 'n/a'
+        return 0
+    fi
+    if [[ ! -f "$f" ]]; then
+        printf 'none'
+        return 0
+    fi
+    out=$(jq -r '[.result, .at] | map(tostring | gsub("[^A-Za-z0-9_.:-]"; "_")) | "\(.[0])@\(.[1])"' "$f" 2>/dev/null) || out=""
+    printf '%s' "${out:-invalid}"
+}
+
+its_block_doc() {   # $1 verb, $2 exit code, $3 errors, $4 changed (true|false)
+    its_doc "$1" "$2" "$3" '{file: $file, state: $state, begin_line: ($b | tonumber), end_line: ($e | tonumber),
+        marker_lines: ($m | if . == "" then [] else split(",") | map(tonumber) end), changed: ($changed == "true"),
+        created: ($created == "true"), backup: ($backup | if . == "" then null else . end)}' \
+        --arg file "$TS_RB_CUSTOM" --arg state "${B_STATE:-absent}" --arg b "${B_BEGIN:-0}" --arg e "${B_END:-0}" \
+        --arg m "$(IFS=,; printf '%s' "${B_MARKERS[*]:-}")" --arg changed "$4" --arg created "${B_CREATED:-false}" \
+        --arg backup "${B_BACKUP:-}"
+}
+
+# Takes the lock that serializes changes to custom-installs.sh (fd in B_LOCKFD).
+its_block_lock() {
+    its_run_dir_ok || return 1
+    exec {B_LOCKFD}>"${TS_RB_RUN_DIR}/custom-installs.lock" || return 1
+    flock -w 10 "$B_LOCKFD"
+}
+
+its_block_unlock() {
+    if [[ -n "${B_LOCKFD:-}" ]]; then
+        exec {B_LOCKFD}>&-
+        B_LOCKFD=""
+    fi
+}
+
+# Replaces custom-installs.sh with the content of temp file $1 (written in the same directory):
+# owner, group and mode of $2 (or root 0644 for a new file), fsync, rename, fsync the directory.
+its_block_commit() {
+    local tmp="$1" ref="$2" st u g m
+    if [[ -n "$ref" ]]; then
+        st=$(stat -c '%u %g %a' -- "$ref" 2>/dev/null) || return 1
+        read -r u g m <<< "$st"
+        chown -- "${u}:${g}" "$tmp" 2>/dev/null || return 1
+        chmod -- "$m" "$tmp" 2>/dev/null || return 1
+    else
+        chmod 0644 -- "$tmp" 2>/dev/null || return 1
+    fi
+    sync -- "$tmp" 2>/dev/null || return 1
+    mv -fT -- "$tmp" "$TS_RB_CUSTOM" 2>/dev/null || return 1
+    sync -- "${TS_RB_CUSTOM%/*}" 2>/dev/null || true
+    return 0
+}
+
+# block-insert [--check]: one marked, idempotent block directly after the shebang line (or at the
+# top); the rest of the file stays byte for byte. --check builds the result without writing.
+its_block_insert() {
+    local check="$1" src tmpl="${TS_RB_ROOT}/assets/custom-installs.sh" first="" tmp ref="" bak
+    B_CREATED="false" B_BACKUP=""
+    if [[ ! -e "$TS_RB_CUSTOM" ]] && [[ ! -L "$TS_RB_CUSTOM" ]]; then
+        if ! its_custom_file_ok "$tmpl"; then
+            B_CODE="E_TEMPLATE_MISSING"; B_MSG="the custom-installs.sh template is missing"
+            return 1
+        fi
+        src="$tmpl"
+        B_CREATED="true"
+    else
+        its_custom_file_ok "$TS_RB_CUSTOM" || return 1
+        src="$TS_RB_CUSTOM"
+        ref="$TS_RB_CUSTOM"
+    fi
+    its_block_scan "$src" || { B_CODE="E_CUSTOM_INSTALLS_UNSAFE"; B_MSG="${src} cannot be read"; return 1; }
+    if [[ "$B_STATE" == malformed ]]; then
+        B_CODE="E_BLOCK_MALFORMED"; B_MSG="unmatched TunnelSats markers at lines $(IFS=,; printf '%s' "${B_MARKERS[*]}"): fix them by hand"
+        return 1
+    fi
+    if [[ "$B_STATE" == present ]] && cmp -s <(sed -n "${B_BEGIN},${B_END}p" "$src") <(its_block_text); then
+        B_CHANGED="false"
+        return 0
+    fi
+    if ! bash -n "$src" 2>/dev/null; then
+        B_CODE="E_CUSTOM_INSTALLS_SYNTAX"; B_MSG="${src} does not pass bash -n; the block is not added"
+        return 1
+    fi
+    tmp=$(mktemp "${TS_RB_CUSTOM%/*}/.custom-installs.sh.tunnelsats.XXXXXX" 2>/dev/null) || {
+        B_CODE="E_WRITE_FAILED"; B_MSG="no temp file next to ${TS_RB_CUSTOM}"; return 1; }
+    if [[ "$B_STATE" == present ]]; then
+        { head -n "$((B_BEGIN - 1))" -- "$src"; its_block_text; tail -n "+$((B_END + 1))" -- "$src"; } > "$tmp"
+    else
+        IFS= read -r first < "$src" || true
+        if [[ "$first" == '#!'* ]]; then
+            { printf '%s\n' "$first"; its_block_text; tail -n +2 -- "$src"; } > "$tmp"
+        else
+            { its_block_text; cat -- "$src"; } > "$tmp"
+        fi
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f -- "$tmp"
+        B_CODE="E_BLOCK_SYNTAX"; B_MSG="the result would not pass bash -n; nothing was changed"
+        return 1
+    fi
+    if [[ "$check" -eq 1 ]]; then
+        rm -f -- "$tmp"
+        B_CHANGED="false"
+        B_CREATED="false"
+        return 0
+    fi
+    # Single-slot backup of the state before TunnelSats first changed the file
+    bak="${TS_RB_APPDATA}/tunnelsats/backup/custom-installs.sh.pre-tunnelsats"
+    if [[ -n "$ref" ]] && [[ ! -e "$bak" ]]; then
+        if ! its_state_subdir backup || ! its_atomic_copy "$ref" "$bak" 0600; then
+            rm -f -- "$tmp"
+            B_CODE="E_BACKUP_FAILED"; B_MSG="the backup of custom-installs.sh could not be written; nothing was changed"
+            return 1
+        fi
+        B_BACKUP="$bak"
+    fi
+    if ! its_block_commit "$tmp" "$ref"; then
+        rm -f -- "$tmp"
+        B_CODE="E_WRITE_FAILED"; B_MSG="${TS_RB_CUSTOM} could not be replaced"
+        return 1
+    fi
+    B_CHANGED="true"
+    its_block_scan "$TS_RB_CUSTOM"
+    if [[ "$B_STATE" != present ]]; then
+        B_CODE="E_BLOCK_READBACK"; B_MSG="the block is not present after writing"
+        return 1
+    fi
+    return 0
+}
+
+# block-remove: drops the BEGIN line, the END line and the lines between them, nothing else.
+its_block_remove() {
+    local tmp was_ok=0
+    B_CREATED="false" B_BACKUP=""
+    if [[ ! -e "$TS_RB_CUSTOM" ]] && [[ ! -L "$TS_RB_CUSTOM" ]]; then
+        B_STATE="absent" B_CHANGED="false"
+        return 0
+    fi
+    its_custom_file_ok "$TS_RB_CUSTOM" || return 1
+    its_block_scan "$TS_RB_CUSTOM" || { B_CODE="E_CUSTOM_INSTALLS_UNSAFE"; B_MSG="cannot be read"; return 1; }
+    case "$B_STATE" in
+        absent) B_CHANGED="false"; return 0 ;;
+        malformed)
+            B_CODE="E_BLOCK_MALFORMED"; B_MSG="unmatched TunnelSats markers at lines $(IFS=,; printf '%s' "${B_MARKERS[*]}"): fix them by hand"
+            return 1
+            ;;
+    esac
+    bash -n "$TS_RB_CUSTOM" 2>/dev/null && was_ok=1
+    tmp=$(mktemp "${TS_RB_CUSTOM%/*}/.custom-installs.sh.tunnelsats.XXXXXX" 2>/dev/null) || {
+        B_CODE="E_WRITE_FAILED"; B_MSG="no temp file next to ${TS_RB_CUSTOM}"; return 1; }
+    { head -n "$((B_BEGIN - 1))" -- "$TS_RB_CUSTOM"; tail -n "+$((B_END + 1))" -- "$TS_RB_CUSTOM"; } > "$tmp"
+    if [[ "$was_ok" -eq 1 ]] && ! bash -n "$tmp" 2>/dev/null; then
+        rm -f -- "$tmp"
+        B_CODE="E_BLOCK_SYNTAX"; B_MSG="the result would not pass bash -n; nothing was changed"
+        return 1
+    fi
+    if ! its_block_commit "$tmp" "$TS_RB_CUSTOM"; then
+        rm -f -- "$tmp"
+        B_CODE="E_WRITE_FAILED"; B_MSG="${TS_RB_CUSTOM} could not be replaced"
+        return 1
+    fi
+    B_CHANGED="true"
+    its_block_scan "$TS_RB_CUSTOM"
+    if [[ "$B_STATE" != absent ]]; then
+        B_CODE="E_BLOCK_READBACK"; B_MSG="the block is still present after writing"
+        return 1
+    fi
+    return 0
+}
+
+# block-insert [--check] | block-remove | block-status, all with [--json].
+its_cmd_block() {
+    local verb="$1" check=0 json=0 a rc errors="[]"
+    shift
+    for a in "$@"; do
+        case "$a" in
+            --check) [[ "$verb" == block-insert ]] || { its_usage >&2; return 2; }; check=1 ;;
+            --json) json=1 ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+    done
+    B_STATE="absent" B_BEGIN=0 B_END=0 B_MARKERS=() B_CHANGED="false" B_CREATED="false" B_BACKUP="" B_CODE="" B_MSG=""
+    if [[ "$verb" == block-status ]]; then
+        rc=0
+        if [[ -e "$TS_RB_CUSTOM" ]] || [[ -L "$TS_RB_CUSTOM" ]]; then
+            if ! its_custom_file_ok "$TS_RB_CUSTOM" || ! its_block_scan "$TS_RB_CUSTOM"; then
+                rc=1
+            fi
+        fi
+    else
+        its_require_root "$verb" || return 2
+        if ! its_block_lock; then
+            B_CODE="E_BUSY"; B_MSG="another change to custom-installs.sh is running"
+            rc=1
+        elif [[ "$verb" == block-insert ]]; then
+            its_block_insert "$check"
+            rc=$?
+        else
+            its_block_remove
+            rc=$?
+        fi
+        its_block_unlock
+    fi
+    [[ -n "$B_CODE" ]] && errors=$(its_err "$B_CODE" operational "$B_MSG")
+    if [[ "$json" -eq 1 ]]; then
+        its_block_doc "$verb" "$rc" "$errors" "$B_CHANGED"
+    else
+        echo "state=${B_STATE} changed=${B_CHANGED}${B_CODE:+ error=${B_CODE}}"
+        [[ -n "$B_MSG" ]] && its_log "# ${verb}: ${B_MSG}"
+    fi
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------------------------
+# restore: what the block runs during provisioning after an SD-card update
+# ---------------------------------------------------------------------------------------------
+
+# One line to the journal (tunnelsats-restore) and one to stdout (raspiblitz.log) or stderr.
+its_rlog() {
+    its_journal tunnelsats-restore "$1"
+    if [[ "${R_JSON:-0}" -eq 1 ]]; then
+        its_log "# TunnelSats: $1"
+    else
+        echo "# TunnelSats: $1"
+    fi
+}
+
+its_restore_record() {   # $1 result, $2 error code
+    local f="${TS_RB_APPDATA}/tunnelsats/last-restore.json" doc decision=""
+    [[ -d "${TS_RB_APPDATA}/tunnelsats" ]] || return 0
+    [[ -n "${R_BASE:-}" ]] && decision=$(jq -r '.decision // empty' "${TS_RB_RUN_DIR}/guard-${R_BASE}.json" 2>/dev/null)
+    doc=$(jq -n -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg result "$1" --arg error "$2" \
+        --arg version "$TS_PIN_VERSION" --arg restarted "${R_RESTARTED:-}" --arg decision "${decision:-}" \
+        '{at: $at, result: $result, error: ($error | if . == "" then null else . end), tool_version: $version,
+          ln_restarted: (if $restarted == "true" then true elif $restarted == "false" then false else null end),
+          guard_decision: ($decision | if . == "" then null else . end)}') || return 1
+    its_atomic_write "$f" "${doc}"$'\n' 0644 || its_log "# TunnelSats: last-restore.json could not be written"
+}
+
+its_restore_doc() {   # $1 exit code, $2 result, $3 error code
+    [[ "${R_JSON:-0}" -eq 1 ]] || return 0
+    local errors="[]"
+    [[ -n "$3" ]] && errors=$(its_err "$3" operational "restore: $2")
+    its_doc restore "$1" "$errors" '{result: $result, ln_restarted: (if $r == "true" then true elif $r == "false" then false else null end)}' \
+        --arg result "$2" --arg r "${R_RESTARTED:-}"
+}
+
+# Succeeds if the pinned tool reports a managed install for unit $2 (script $1).
+its_restore_managed() {
+    its_tool_run "$1" "$TS_PIN_SHA256" 35 verify --json --no-probe || return 1
+    [[ "$(jq -r -s 'if length == 1 then (.[0].managed == true and .[0].unit == $u) else false end' \
+        --arg u "$2" "$X_DOC" 2>/dev/null)" == true ]]
+}
+
+its_cmd_restore() {
+    local a impl cimpl unit conf code
+    R_JSON=0 R_BASE="" R_RESTARTED=""
+    for a in "$@"; do
+        case "$a" in
+            --json) R_JSON=1 ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+    done
+    if ! its_is_root; then
+        its_rlog "restore must run as root"
+        its_restore_doc 1 failed E_NOT_ROOT
+        return 1
+    fi
+    if [[ "$(its_conf_get tunnelsats)" != on ]]; then
+        its_rlog "not active, nothing to restore"
+        its_restore_doc 0 not_active ""
+        return 0
+    fi
+    impl=$(its_conf_get tunnelsatsImpl) || impl=""
+    case "$impl" in
+        lnd) cimpl="lnd"; unit="lnd.service"; R_BASE="lnd" ;;
+        cl) cimpl="cln"; unit="lightningd.service"; R_BASE="lightningd" ;;
+        *)
+            its_rlog "tunnelsatsImpl is not set; Lightning stays Tor-only (SSH menu > SUBSCRIBE > TunnelSats > REPAIR)"
+            its_restore_record not_configured E_NOT_CONFIGURED
+            its_restore_doc 3 not_configured E_NOT_CONFIGURED
+            return 3
+            ;;
+    esac
+    conf="$(its_state_dir)/tunnelsats.conf"
+    if ! its_stored_conf_ok "$conf"; then
+        its_rlog "stored config missing or not root 0600; Lightning stays Tor-only (IMPORT again or REMOVE)"
+        its_restore_record not_configured E_NOT_CONFIGURED
+        its_restore_doc 3 not_configured E_NOT_CONFIGURED
+        return 3
+    fi
+    its_run_dir_ok || true
+    if ! its_fetch_offline; then
+        its_rlog "no verified stored copy of tunnelsats.sh ${TS_PIN_VERSION} (${F_CODE}); downloading the pinned one"
+        if ! its_fetch_online; then
+            its_rlog "download failed (${F_CODE}); nothing installed, Lightning stays Tor-only"
+            its_restore_record failed "$F_CODE"
+            its_restore_doc 1 failed "$F_CODE"
+            its_cleanup
+            return 1
+        fi
+    fi
+    if its_restore_managed "$F_PATH" "$unit"; then
+        its_rlog "managed mode is already in place for ${unit}"
+    else
+        its_rlog "installing managed mode for ${unit} (tunnelsats.sh ${TS_PIN_VERSION})"
+        if ! its_tool_run "$F_PATH" "$TS_PIN_SHA256" 900 install --managed raspiblitz --impl "$cimpl" \
+            --network mainnet --config "$conf" --non-interactive --yes --json; then
+            code="E_TOOL_COPY"
+        elif [[ "$X_RC" == 124 ]] || [[ "$X_RC" == 137 ]]; then
+            code="E_TIMEOUT"
+        elif [[ "$(jq -r -s --argjson rc "$X_RC" --argjson c "$TS_PIN_CONTRACT" \
+            'length == 1 and (.[0] | type) == "object" and .[0].contract == $c and .[0].exit_code == $rc' \
+            "$X_DOC" 2>/dev/null)" != true ]]; then
+            code="E_TOOL_OUTPUT"
+        elif [[ "$X_RC" -eq 0 ]]; then
+            code=""
+            R_RESTARTED=$(jq -r -s '.[0].ln_restarted | if type == "boolean" then tostring else empty end' "$X_DOC" 2>/dev/null)
+        else
+            code=$(jq -r -s '.[0].errors[0].code // empty' "$X_DOC" 2>/dev/null)
+            [[ "$code" =~ ^E_[A-Z0-9_]{1,40}$ ]] || code="E_INSTALL_FAILED"
+            if [[ "$X_RC" -eq 7 ]] && [[ "$code" == E_MANAGED_PRESENT ]] && its_restore_managed "$F_PATH" "$unit"; then
+                code=""
+            fi
+        fi
+        if [[ -n "$code" ]]; then
+            its_rlog "install failed (${code}); Lightning stays Tor-only. SSH menu > SUBSCRIBE > TunnelSats > REPAIR"
+            its_restore_record failed "$code"
+            its_restore_doc 1 failed "$code"
+            its_cleanup
+            return 1
+        fi
+        its_rlog "managed mode restored$([[ "$R_RESTARTED" == true ]] && printf '; Lightning restarted')"
+    fi
+    if ! its_tick_timer on >/dev/null; then
+        its_rlog "the tick timer could not be set up"
+    fi
+    its_restore_record ok ""
+    its_restore_doc 0 ok ""
+    its_cleanup
+    return 0
+}
+
+# ---------------------------------------------------------------------------------------------
+# tick-timer on|off|status: the RaspiBlitz-owned 5-minute tick (restart notice)
+# ---------------------------------------------------------------------------------------------
+
+its_tick_service_text() {
+    printf '%s\n' "[Unit]" "Description=TunnelSats RaspiBlitz tick (restart notice)" "[Service]" "Type=oneshot" \
+        "ExecStart=${ITS_PROD_MODULE} tick --json"
+}
+
+its_tick_timer_text() {
+    printf '%s\n' "[Unit]" "Description=TunnelSats RaspiBlitz tick every 5 minutes" "[Timer]" "OnBootSec=5min" \
+        "OnUnitActiveSec=5min" "[Install]" "WantedBy=timers.target"
+}
+
+its_tick_timer() {
+    local svc="${TS_RB_UNIT_DIR}/tunnelsats-tick.service" tmr="${TS_RB_UNIT_DIR}/tunnelsats-tick.timer" state
+    case "${1:-}" in
+        on)
+            its_atomic_write "$svc" "$(its_tick_service_text)"$'\n' 0644 || return 1
+            its_atomic_write "$tmr" "$(its_tick_timer_text)"$'\n' 0644 || return 1
+            "$TS_RB_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || return 1
+            "$TS_RB_SYSTEMCTL" enable --now tunnelsats-tick.timer >/dev/null 2>&1 || return 1
+            echo "active"
+            ;;
+        off)
+            if [[ -e "$tmr" ]] || [[ -e "$svc" ]]; then
+                "$TS_RB_SYSTEMCTL" disable --now tunnelsats-tick.timer >/dev/null 2>&1 || true
+                rm -f -- "$svc" "$tmr" || return 1
+                "$TS_RB_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
+            fi
+            [[ ! -e "$svc" ]] && [[ ! -e "$tmr" ]] || return 1
+            echo "absent"
+            ;;
+        status)
+            if [[ ! -e "$tmr" ]]; then
+                echo "absent"
+            else
+                state=$("$TS_RB_SYSTEMCTL" is-active tunnelsats-tick.timer 2>/dev/null) || true
+                [[ "$state" == active ]] && echo "active" || echo "inactive"
+            fi
+            ;;
+        *) its_usage >&2; return 2 ;;
+    esac
+    return 0
+}
+
+its_cmd_tick_timer() {
+    if [[ "${1:-}" != status ]] && ! its_is_root; then
+        its_log "# tick-timer must run as root"
+        return 1
+    fi
+    its_tick_timer "$@"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1260,6 +2196,14 @@ main() {
         guard) its_cmd_guard "$@" ;;
         audit) its_cmd_audit "$@" ;;
         status) its_cmd_status "$@" ;;
+        fetch) its_cmd_fetch "$@" ;;
+        install) its_cmd_install "$@" ;;
+        uninstall) its_cmd_uninstall "$@" ;;
+        verify) its_cmd_verify "$@" ;;
+        detect) its_cmd_detect "$@" ;;
+        block-insert | block-remove | block-status) its_cmd_block "$verb" "$@" ;;
+        restore) its_cmd_restore "$@" ;;
+        tick-timer) its_cmd_tick_timer "$@" ;;
         -h | --help | help) its_usage; return 0 ;;
         *) its_usage >&2; return 2 ;;
     esac
