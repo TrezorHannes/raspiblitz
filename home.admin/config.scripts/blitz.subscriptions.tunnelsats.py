@@ -1231,8 +1231,22 @@ def lightning_info(deps, impl):
     return parse_one_json(out) if rc == 0 else None
 
 
-def announce_check(impl, info, record, state):
-    """VPN address announced, onion present, no other clearnet address."""
+def public_ipv4(value):
+    """value if it is a dotted public IPv4 address, else None."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}", value):
+        return None
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ValueError:
+        return None
+    return value if address.is_global and not address.is_multicast else None
+
+
+def announce_check(impl, info, record, state, live_ipv4=None):
+    """VPN address announced, onion present, no other clearnet address. LND resolves externalhosts
+    itself and announces the resolved IPv4, so its uris carry <ipv4>:<vpn_port>: the endpoint's
+    address at the start (guard record) and now (live_ipv4, endpoint.ipv4 of this CHECK's verify)
+    both count as the VPN address. CLN announces the address of the guard record."""
     if info is None:
         return "degraded", "fail", "Lightning did not answer getinfo (locked or not running)", None
     if impl == "lnd":
@@ -1244,8 +1258,9 @@ def announce_check(impl, info, record, state):
     host, port = state.get("endpoint_host"), state.get("vpn_port")
     announce = (record or {}).get("announce") or {}
     expected = {"%s:%s" % (host, port)}
-    if announce.get("ipv4"):
-        expected.add("%s:%s" % (announce["ipv4"], port))
+    for ipv4 in (public_ipv4(announce.get("ipv4")), public_ipv4(live_ipv4) if impl == "lnd" else None):
+        if ipv4:
+            expected.add("%s:%s" % (ipv4, port))
     foreign = [a for a in clear if a not in expected]
     if foreign:
         return "unsafe", "fail", "another clearnet address is announced", onion
@@ -1334,7 +1349,9 @@ def run_check(deps):
     else:
         add("restart_needed", "degraded", "pass", "no restart needed")
     info = lightning_info(deps, impl) if props["ActiveState"] == "active" else None
-    cls, res, detail, onion = announce_check(impl, info, record, state)
+    endpoint = (verify or {}).get("endpoint")
+    live_ipv4 = endpoint.get("ipv4") if isinstance(endpoint, dict) else None
+    cls, res, detail, onion = announce_check(impl, info, record, state, live_ipv4)
     add("announce", cls, res, detail)
     if impl == "cl":
         bindings = ["%s:%s" % (b.get("address"), b.get("port")) for b in (info or {}).get("binding") or []

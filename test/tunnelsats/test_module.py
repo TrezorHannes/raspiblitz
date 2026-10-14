@@ -92,7 +92,8 @@ class FakeSystem:
             "lightningd.service": {"ActiveState": "inactive", "InvocationID": "", "MainPID": "0", "ControlGroup": "",
                                    "FragmentPath": "/etc/systemd/system/lightningd.service", "NeedDaemonReload": "no"},
         }
-        self.getinfo = {"uris": ["0280a@de2.tunnelsats.com:24556", "0280a@exampleonion.onion:9735"]}
+        # LND resolves externalhosts and announces the resolved address (1.2.3.4 = endpoint.ipv4)
+        self.getinfo = {"uris": ["0280a@1.2.3.4:24556", "0280a@exampleonion.onion:9735"]}
         self.wg = {"latest-handshakes": "%s\t%d\n" % (BOB_PUB, int(NOW.timestamp()) - 30),
                    "transfer": "%s\t1000\t2000\n" % BOB_PUB}
 
@@ -840,11 +841,36 @@ class TestCheck(ModuleTestCase):
         self.assertTrue(doc["clearnet_blocked"])
 
     def test_foreign_clearnet_address_is_unsafe(self):
-        self.fake.getinfo = {"uris": ["0280a@de2.tunnelsats.com:24556", "0280a@exampleonion.onion:9735",
+        self.fake.getinfo = {"uris": ["0280a@1.2.3.4:24556", "0280a@exampleonion.onion:9735",
                                       "0280a@198.51.100.7:9735"]}
         doc = self.run_verb("check")
         self.assertEqual("unsafe", doc["verdict"])
         self.assertIn("announce", self.ids(doc))
+
+    def test_lnd_announces_the_vpn_address_resolved_at_the_start_or_now(self):
+        verify = fixture_json("verify", "protected.json")
+        cases = [
+            # record without the address (older guard), verify knows it now
+            (None, "1.2.3.4", ["0280a@1.2.3.4:24556"], "protected"),
+            # the endpoint moved since the start: both addresses count
+            ("5.6.7.8", "1.2.3.4", ["0280a@5.6.7.8:24556"], "protected"),
+            ("5.6.7.8", "1.2.3.4", ["0280a@1.2.3.4:24556"], "protected"),
+            # DNS fails now: the address of the start still counts
+            ("1.2.3.4", None, ["0280a@1.2.3.4:24556"], "protected"),
+            # any other address, the VPN address on another port, a private address: unsafe
+            ("1.2.3.4", "1.2.3.4", ["0280a@9.9.9.9:24556"], "unsafe"),
+            ("1.2.3.4", "1.2.3.4", ["0280a@1.2.3.4:9735"], "unsafe"),
+            ("1.2.3.4", "10.0.0.1", ["0280a@10.0.0.1:24556"], "unsafe"),
+        ]
+        for recorded, live, uris, verdict in cases:
+            with self.subTest(recorded=recorded, live=live, uris=uris):
+                self.record(ipv4=recorded)
+                verify["endpoint"]["ipv4"] = live
+                self.fake.its["verify"] = (0, verify)
+                self.fake.getinfo = {"uris": uris + ["0280a@exampleonion.onion:9735"]}
+                doc = self.run_verb("check")
+                self.assertEqual(verdict, doc["verdict"], self.ids(doc))
+                self.assertEqual(verdict == "unsafe", "announce" in self.ids(doc))
 
     def test_restart_needed_after_a_tor_only_start(self):
         self.record(decision="tor-only", reason="emergency_block")

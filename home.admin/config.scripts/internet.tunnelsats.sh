@@ -766,7 +766,8 @@ its_guard_verify_once() {
 # the address is not yet confirmed only for lack of a handshake, verify runs again until
 # TS_RB_HANDSHAKE_WAIT seconds have passed (each poll gets at least 5 s, at most the verify timeout).
 # A poll that times out ends the wait with the last valid result; any other poll result replaces
-# it. No wait for LND (it announces the host name) and none in --dry-run.
+# it. No wait for LND (it resolves externalhosts itself, announces the resolved address and resolves
+# it again periodically) and none in --dry-run.
 its_guard_verify() {
     local deadline remaining t keep us=$'\x1f'
     V_MS=0
@@ -818,6 +819,11 @@ its_render() {
     if [[ "$G_IMPL" == lnd ]]; then
         R_FLAGS="--tor.skip-proxy-for-clearnet-targets --externalhosts=${V_HOST}:${V_PORT}"
         R_REASON="ok"
+        # LND resolves the host itself and announces the resolved address: the record keeps the
+        # endpoint's address at this start, so CHECK can tell it from any other clearnet address
+        if its_valid_public_ipv4 "$V_IPV4"; then
+            D_ANN_IPV4="$V_IPV4"
+        fi
     else
         [[ -n "${C_STATE:-}" ]] || its_cln_confirm
         if [[ "$C_STATE" == confirmed ]]; then
@@ -1039,10 +1045,10 @@ its_guard_record() {
 its_guard_summary() {
     local ann="-" rep="-" dur
     if [[ "$D_DECISION" == hybrid ]]; then
-        if [[ -n "$D_ANN_IPV4" ]]; then
-            ann="${D_ANN_IPV4}:${D_ANN_PORT}"
-        elif [[ "$G_IMPL" == lnd ]]; then
+        if [[ "$G_IMPL" == lnd ]]; then
             ann="${D_ANN_HOST}:${D_ANN_PORT}"
+        elif [[ -n "$D_ANN_IPV4" ]]; then
+            ann="${D_ANN_IPV4}:${D_ANN_PORT}"
         fi
     fi
     [[ ${#A_REPAIRED[@]} -gt 0 ]] && rep=$(IFS=,; printf '%s' "${A_REPAIRED[*]}")

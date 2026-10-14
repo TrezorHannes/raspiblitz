@@ -52,7 +52,7 @@ skip_if_root() {
     [ "$(record_field lnd .flags)" = "$LND_FLAGS" ]
     [ "$(record_field lnd .announce.host)" = de2.tunnelsats.com ]
     [ "$(record_field lnd .announce.port)" = 24556 ]
-    [ "$(record_field lnd .announce.ipv4)" = null ]
+    [ "$(record_field lnd .announce.ipv4)" = 1.2.3.4 ]
     [ "$(record_field lnd .verify.rc)" = 5 ]
     [ "$(record_field lnd .verify.tool_sha256)" = "${TS_ACCEPTED_SHA256[0]}" ]
     [ "$(record_field lnd .boot_id)" = 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0 ]
@@ -97,6 +97,28 @@ skip_if_root() {
     [ "$status" -eq 0 ]
     assert_decision hybrid ok
     [ "$(env_of lightningd)" = "TUNNELSATS_CLN_ARGS=${CLN_FLAGS_ANNOUNCE}" ]
+}
+
+@test "H5: LND announces what it resolves: the record keeps a public endpoint IPv4 only, the flags never change" {
+    lnd_node activating_dns_unresolved.json
+    run call its_cmd_guard lnd mainnet
+    [ "$status" -eq 0 ]
+    assert_decision hybrid ok
+    [ "$(env_of lnd)" = "TUNNELSATS_LND_ARGS=${LND_FLAGS}" ]
+    [ "$(record_field lnd .announce.ipv4)" = null ]
+    [[ "$output" == *"announce=de2.tunnelsats.com:24556 "* ]]
+    its_setup
+    lnd_node
+    jq -c '.endpoint.ipv4 = "10.9.0.1"' "${FIXTURES}/verify/activating_tunnel_up.json" > "$FX/private.json"
+    printf '#!/bin/bash\ncat %q\nexit 5\n' "$FX/private.json" > "$TS_RB_TOOL"
+    chmod 0755 "$TS_RB_TOOL"
+    TS_ACCEPTED_SHA256=("$(sha256sum "$TS_RB_TOOL" | cut -d' ' -f1)")
+    run call its_cmd_guard lnd mainnet
+    [ "$status" -eq 0 ]
+    assert_decision hybrid ok
+    [ "$(env_of lnd)" = "TUNNELSATS_LND_ARGS=${LND_FLAGS}" ]
+    [ "$(record_field lnd .announce.ipv4)" = null ]
+    assert_schema "${TS_RB_RUN_DIR}/guard-lnd.json"
 }
 
 # ---------------------------------------------------------------------------------------------
