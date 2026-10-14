@@ -57,8 +57,12 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
+# TunnelSats start guard (no-op unless TunnelSats is on): clearnet flags for this start only
+Environment=TUNNELSATS_CLN_ARGS=
+EnvironmentFile=-/run/tunnelsats/hybrid-${netprefix}lightningd.env
 ExecStartPre=-/home/admin/config.scripts/cl.check.sh prestart $CHAIN
-ExecStart=/bin/sh -c '${passwordInput}/usr/local/bin/lightningd --conf=${CLCONF} ${encryptedHSMoption} --rpc-file-mode 0660'
+ExecStartPre=+/home/admin/config.scripts/internet.tunnelsats.sh guard cl $CHAIN
+ExecStart=/bin/sh -c '${passwordInput}/usr/local/bin/lightningd --conf=${CLCONF} ${encryptedHSMoption} --rpc-file-mode 0660 \$\$TUNNELSATS_CLN_ARGS'
 ExecStartPost=-/home/admin/config.scripts/cl.check.sh poststart $CHAIN
 
 # Creates /run/lightningd owned by bitcoin

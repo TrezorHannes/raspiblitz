@@ -343,9 +343,13 @@ PartOf=${netprefix}bitcoind.service
 
 [Service]
 EnvironmentFile=/mnt/hdd/app-data/raspiblitz.conf
+# TunnelSats start guard (no-op unless TunnelSats is on): clearnet flags for this start only
+Environment=TUNNELSATS_LND_ARGS=
+EnvironmentFile=-/run/tunnelsats/hybrid-${netprefix}lnd.env
 
 ExecStartPre=-/home/admin/config.scripts/lnd.check.sh prestart ${CHAIN}
-ExecStart=/usr/local/bin/lnd --configfile=/mnt/hdd/app-data/lnd/${netprefix}lnd.conf
+ExecStartPre=+/home/admin/config.scripts/internet.tunnelsats.sh guard lnd ${CHAIN}
+ExecStart=/usr/local/bin/lnd --configfile=/mnt/hdd/app-data/lnd/${netprefix}lnd.conf \$TUNNELSATS_LND_ARGS
 # avoid hanging on stop
 # ExecStop=/usr/local/bin/lncli -n=${CHAIN} --rpcserver localhost:1${rpcportmod}009 stop
 PIDFile=/mnt/hdd/app-data/lnd/${netprefix}lnd.pid

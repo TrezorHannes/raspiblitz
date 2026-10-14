@@ -12,8 +12,12 @@ After=bitcoind.service
 #OnFailure=systemd-sendmail@%n
 
 [Service]
+# TunnelSats start guard (no-op unless TunnelSats is on): clearnet flags for this start only
+Environment=TUNNELSATS_LND_ARGS=
+EnvironmentFile=-/run/tunnelsats/hybrid-lnd.env
 ExecStartPre=-/home/admin/config.scripts/lnd.check.sh prestart mainnet
-ExecStart=/usr/local/bin/lnd --configfile=/mnt/hdd/app-data/lnd/lnd.conf
+ExecStartPre=+/home/admin/config.scripts/internet.tunnelsats.sh guard lnd mainnet
+ExecStart=/usr/local/bin/lnd --configfile=/mnt/hdd/app-data/lnd/lnd.conf $TUNNELSATS_LND_ARGS
 # avoid hanging on stop
 # ExecStop=/usr/local/bin/lncli stop
 PIDFile=/home/bitcoin/lnd.pid
