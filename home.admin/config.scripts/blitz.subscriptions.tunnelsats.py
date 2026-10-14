@@ -1578,6 +1578,39 @@ def at_rest_action(impl, doc, unit, then):
             "lines": lines, "then": then}
 
 
+def keep_pending_removal(deps, unit, doc):
+    """Records in state.json that a refused REMOVE left unit stopped (and disabled, per uninstall
+    document doc): the menu then offers REMOVE again instead of START, and the next REMOVE enables
+    and starts the unit once its config is Tor-only at rest."""
+    if not unit or not (doc.get("ln_disabled") or (doc.get("ln_was_active") and not doc.get("ln_started"))):
+        return
+    state = load_state(deps)
+    if state is None:
+        return
+    state["remove_pending"] = {"unit": unit, "ln_was_active": bool(doc.get("ln_was_active")),
+                               "ln_disabled": bool(doc.get("ln_disabled")), "at": now_iso(deps)}
+    save_state(deps, state)
+
+
+def pending_removal(deps, state):
+    """The unit a refused REMOVE left stopped, as an uninstall-like document, while that unit still
+    does not run (someone may have started it by hand since); else None."""
+    pending = (state or {}).get("remove_pending")
+    if not isinstance(pending, dict) or pending.get("unit") not in UNITS.values():
+        return None
+    if unit_props(deps, pending["unit"], "ActiveState")["ActiveState"] not in ("inactive", "failed", ""):
+        return None
+    return {"unit": pending["unit"], "ln_was_active": bool(pending.get("ln_was_active")),
+            "ln_disabled": bool(pending.get("ln_disabled")), "ln_started": False}
+
+
+def clear_pending_removal(deps):
+    state = load_state(deps)
+    if state is not None and "remove_pending" in state:
+        del state["remove_pending"]
+        save_state(deps, state)
+
+
 def cmd_uninstall(deps, args, result):
     if not args.yes:
         raise ModuleError("E_CONFIRMATION_REQUIRED", "usage", "REMOVE needs --yes", EXIT_USAGE)
@@ -1618,6 +1651,14 @@ def cmd_uninstall(deps, args, result):
                                   "ln_was_active": bool(doc.get("ln_was_active")),
                                   "ln_started": bool(doc.get("ln_started")), "node_config": doc.get("node_config")})
             unit = doc.get("unit") if doc.get("unit") in UNITS.values() else unit
+        else:
+            # a REMOVE refused earlier (config not Tor-only at rest) kept this unit stopped: this run
+            # audits it again and enables and starts it only if the config is Tor-only now
+            pending = pending_removal(deps, state)
+            if pending:
+                doc = pending
+                unit = pending["unit"]
+                result.fields["ln_was_active"] = pending["ln_was_active"]
         # uninstall --managed leaves the unit stopped and disabled when it cannot prove the node
         # config clean (on RaspiBlitz always: ExecStart takes $TUNNELSATS_*_ARGS). Only this REMOVE's
         # own audit of exactly that unit's implementation may undo it; the other one is checked too.
@@ -1664,6 +1705,8 @@ def cmd_uninstall(deps, args, result):
                 "detail": "; ".join(a["detail"] for a in actions),
                 "lines": [line for a in actions for line in a["lines"]],
                 "then": then}
+            if not main_ok:
+                keep_pending_removal(deps, unit, doc)
             result.error("E_AT_REST_UNREPAIRABLE", "operational",
                          "%s. Remove the listed TunnelSats settings%s" % (
                              "; ".join(messages), ", then run: sudo %s" % then if then else ""), EXIT_OPERATIONAL)
@@ -1678,6 +1721,8 @@ def cmd_uninstall(deps, args, result):
         if args.purge:
             purge(deps)
             result.fields["purged"] = True
+        else:
+            clear_pending_removal(deps)
 
 
 # ------------------------------------------------------------------------------------------
@@ -1904,6 +1949,69 @@ def menu_run(deps, verb_args):
     return result.document()
 
 
+def menu_choices(deps, state, conf, found=None):
+    """The menu entries (tag, text) and a notice shown above them, or None. START and RESTART only
+    while TunnelSats is on: the start guard then audits the config at rest before Lightning runs.
+    With TunnelSats off (after REMOVE) nothing would, so this menu never starts Lightning then;
+    after a refused REMOVE it shows what keeps Lightning stopped and offers REMOVE again."""
+    if state is None:
+        choices = [("IMPORT", "Import a WireGuard config (bought on tunnelsats.com)")]
+        if (found or {}).get("adopt_available"):
+            choices.append(("ADOPT", "Take over the existing TunnelSats setup"))
+        choices.append(("ABOUT", "How it works, privacy trade-offs"))
+        return choices, None
+    active_ts = conf.get("tunnelsats") == "on"
+    impl = state.get("impl") or conf.get("tunnelsatsImpl") or "lnd"
+    pending = state.get("remove_pending")
+    notice = None
+    remove = ("REMOVE", "Remove TunnelSats from this node")
+    if not active_ts and isinstance(pending, dict) and pending.get("unit") in UNITS.values():
+        notice = pending_removal_text(deps, pending)
+        remove = ("REMOVE", "Remove again: check the config, then start Lightning")
+    choices = [("STATUS", "Subscription and tunnel status"), ("CHECK", "Connection check"),
+               ("REPAIR", "Re-apply TunnelSats (also: update the pinned tool)"), remove]
+    if active_ts and state.get("mode") != "adopted_legacy" and impl in UNITS:
+        if unit_props(deps, UNITS[impl], "ActiveState")["ActiveState"] != "active":
+            choices.append(("START", "Start Lightning"))
+        else:
+            record = read_guard_record(deps, BASES[impl])
+            if record and record.get("reason") in RESTARTABLE:
+                choices.append(("RESTART", "Restart Lightning to resume clearnet"))
+    return choices, notice
+
+
+def pending_removal_text(deps, pending):
+    """The notice after a refused REMOVE, from a fresh read-only audit of the unit it kept stopped."""
+    unit = pending["unit"]
+    stopped = "stopped and disabled" if pending.get("ln_disabled") else "stopped"
+    rc, audit = its(deps, ["audit", IMPL_OF_UNIT[unit], "--json"], timeout=30)
+    if audit and audit.get("status") == "clean":
+        return ("REMOVE left %s %s. Its config is Tor-only now: choose REMOVE again to finish; it enables "
+                "and starts %s." % (unit, stopped, unit))
+    text = "REMOVE left %s %s: its config is not Tor-only at rest" % (unit, stopped)
+    lines = [line for line in (audit or {}).get("lines") or [] if isinstance(line, str)][:8]
+    if lines:
+        text += ". Remove these lines:\n" + "\n".join("  %s" % line for line in lines)
+    elif audit is None:
+        text += " (the check did not answer)"
+    else:
+        text += " (%s)" % (audit.get("reason") or audit.get("status"))
+    return text + "\nThen choose REMOVE again: it checks the config, then starts %s." % unit
+
+
+def menu_start(deps, restart=False):
+    """START and RESTART of the menu, only while TunnelSats is on (see menu_choices). Returns the
+    implementation it started, or None if TunnelSats is off."""
+    conf = read_rb_conf(deps)
+    if conf.get("tunnelsats") != "on":
+        return None
+    impl = (load_state(deps) or {}).get("impl") or conf.get("tunnelsatsImpl") or "lnd"
+    if impl not in UNITS:
+        return None
+    systemctl(deps, "restart" if restart else "start", UNITS[impl])
+    return impl
+
+
 def cmd_menu(deps, args, result):  # pragma: no cover - interactive
     from dialog import Dialog  # imported only here
     d = Dialog(dialog="dialog", autowidgetsize=True)
@@ -1912,29 +2020,15 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
     while True:
         state = load_state(deps)
         conf = read_rb_conf(deps)
-        choices = []
-        if state is None:
-            choices.append(("IMPORT", "Import a WireGuard config (bought on tunnelsats.com)"))
-            if found is None:
-                os.system("clear")
-                print("# TunnelSats: checking this node ...")
-                found = detect(deps)
-            if found.get("adopt_available"):
-                choices.append(("ADOPT", "Take over the existing TunnelSats setup"))
-            choices.append(("ABOUT", "How it works, privacy trade-offs"))
-        else:
-            impl = state.get("impl") or conf.get("tunnelsatsImpl") or "lnd"
-            choices += [("STATUS", "Subscription and tunnel status"), ("CHECK", "Connection check"),
-                        ("REPAIR", "Re-apply TunnelSats (also: update the pinned tool)"),
-                        ("REMOVE", "Remove TunnelSats from this node")]
-            if state.get("mode") != "adopted_legacy" and impl in UNITS:
-                active = unit_props(deps, UNITS[impl], "ActiveState")["ActiveState"]
-                if active != "active":
-                    choices.append(("START", "Start Lightning"))
-                elif read_guard_record(deps, BASES[impl]) and \
-                        read_guard_record(deps, BASES[impl]).get("reason") in RESTARTABLE:
-                    choices.append(("RESTART", "Restart Lightning to resume clearnet"))
-        code, tag = d.menu("\nTunnelSats VPN for Lightning clearnet:", choices=choices, width=70, height=16,
+        if state is None and found is None:
+            os.system("clear")
+            print("# TunnelSats: checking this node ...")
+            found = detect(deps)
+        choices, notice = menu_choices(deps, state, conf, found)
+        text = "\nTunnelSats VPN for Lightning clearnet:"
+        if notice:
+            text = "\n%s\n%s" % (notice, text)
+        code, tag = d.menu(text, choices=choices, width=78 if notice else 70, height=28 if notice else 16,
                            title="TunnelSats", cancel_label="Back")
         if code != d.OK:
             return
@@ -1986,10 +2080,12 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
             doc = menu_run(deps, ["uninstall", "--yes"] + ([] if code == d.OK else ["--purge"]))
             d.msgbox(result_text(doc), title="REMOVE", width=78, height=20)
         elif tag in ("START", "RESTART"):
-            impl = (state or {}).get("impl") or conf.get("tunnelsatsImpl") or "lnd"
             os.system("clear")
-            systemctl(deps, "restart" if tag == "RESTART" else "start", UNITS[impl])
-            if impl == "lnd" and conf.get("autoUnlock") != "on":
+            impl = menu_start(deps, restart=tag == "RESTART")
+            if impl is None:
+                d.msgbox("TunnelSats is off: this menu starts Lightning only while TunnelSats is on.",
+                         title=tag, width=70, height=8)
+            elif impl == "lnd" and conf.get("autoUnlock") != "on":
                 deps.run([LND_UNLOCK, "chain-unlock", "mainnet"], timeout=600, interactive=True)
             elif impl == "cl" and conf.get("clEncryptedHSM") == "on" and conf.get("clAutoUnlock") != "on":
                 deps.run([CL_HSMTOOL, "unlock", "mainnet"], timeout=600, interactive=True)
@@ -2003,6 +2099,8 @@ def result_text(doc):
             lines += ["", "Lines to remove:"] + ["  %s" % line for line in action["lines"][:8]]
         if action.get("then"):
             lines += ["", "Then run: sudo %s" % action["then"]]
+            if doc.get("command") == "uninstall":
+                lines.append("Or choose REMOVE again: it checks the config first, then starts Lightning.")
         return "\n".join(lines)
     lines = ["Done."]
     if "verdict" in doc:

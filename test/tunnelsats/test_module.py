@@ -833,6 +833,116 @@ class TestRemove(ModuleTestCase):
         self.fake.its["detect"] = (0, fixture_json("tool", "detect_none.json"))
         self.assertEqual(3, self.run_verb("uninstall", "--yes")["exit_code"])
 
+    # -- a refused REMOVE, then the menu and REMOVE again -----------------------------------
+    LINE = "/mnt/hdd/app-data/lnd/lnd.conf:8:externalhosts=de2.tunnelsats.com:24556"
+
+    def refuse_remove(self):
+        """REMOVE refused by an unrepairable at-rest audit. Afterwards the dataplane is gone and the
+        unit is stopped and disabled, as the tool's uninstall leaves it."""
+        self.fake.its["audit lnd --repair"] = (1, self.audit("unrepairable", "tor_inactive", [self.LINE],
+                                                             ["externalhosts"]))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stays_stopped(doc)
+        self.assertIn("Or choose REMOVE again", mod.result_text(doc))
+        self.fake.units["lnd.service"].update({"ActiveState": "inactive", "MainPID": "0", "ControlGroup": "",
+                                               "InvocationID": ""})
+        self.fake.calls.clear()
+        return doc
+
+    def test_after_a_refused_remove_the_menu_offers_remove_again_never_start(self):
+        self.refuse_remove()
+        state = mod.load_state(self.deps)
+        self.assertEqual({"unit": "lnd.service", "ln_was_active": True, "ln_disabled": True},
+                         {k: state["remove_pending"][k] for k in ("unit", "ln_was_active", "ln_disabled")})
+        conf = mod.read_rb_conf(self.deps)
+        self.assertEqual("off", conf.get("tunnelsats"))
+        self.fake.its["audit lnd"] = (1, self.audit("unrepairable", "tor_inactive", [self.LINE], ["externalhosts"]))
+        choices, notice = mod.menu_choices(self.deps, state, conf)
+        self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE"], [tag for tag, _text in choices])
+        self.assertIn("again", dict(choices)["REMOVE"])
+        self.assertIn("lnd.service stopped and disabled", notice)
+        self.assertIn(self.LINE, notice)
+        self.assertIsNone(mod.menu_start(self.deps))
+        self.assertIsNone(mod.menu_start(self.deps, restart=True))
+        self.assertEqual([], self.fake.calls_of("systemctl", "start") + self.fake.calls_of("systemctl", "restart"))
+        # read-only: the menu never repairs or edits the config
+        self.assertEqual([], self.fake.calls_of(mod.ITS, "audit", "lnd", "--repair"))
+        self.fake.its["audit lnd"] = (0, self.audit("clean"))
+        self.assertIn("Tor-only now", mod.menu_choices(self.deps, state, conf)[1])
+
+    def test_remove_again_starts_lightning_once_the_config_is_tor_only(self):
+        self.refuse_remove()
+        self.fake.its["audit lnd --repair"] = (0, self.audit("repaired", None, [], ["externalhosts"]))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual(0, doc["exit_code"], doc)
+        self.assertTrue(doc["removed"] and doc["ln_was_active"] and doc["ln_reenabled"] and doc["ln_started"])
+        f = self.fake
+        self.assertEqual([], f.calls_of(mod.ITS, "uninstall"))
+        self.assertLess(f.calls.index([mod.ITS, "audit", "lnd", "--repair", "--json"]),
+                        f.calls.index(["systemctl", "enable", "lnd.service"]))
+        self.assertLess(f.calls.index(["systemctl", "enable", "lnd.service"]),
+                        f.calls.index(["systemctl", "start", "lnd.service"]))
+        self.assertNotIn("remove_pending", mod.load_state(self.deps))
+
+    def test_remove_again_keeps_lightning_stopped_while_the_config_is_not_tor_only(self):
+        self.refuse_remove()
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stays_stopped(doc)
+        self.assertEqual(([self.LINE], "systemctl enable --now lnd.service"),
+                         (doc["action_required"]["lines"], doc["action_required"]["then"]))
+        self.assertIn("lnd.service stays stopped and disabled", doc["errors"][0]["message"])
+        self.assertIn("remove_pending", mod.load_state(self.deps))
+
+    def test_remove_again_leaves_a_unit_started_by_hand_running(self):
+        self.refuse_remove()
+        self.fake.units["lnd.service"].update({"ActiveState": "active", "MainPID": "4242",
+                                               "ControlGroup": "/system.slice/lnd.service"})
+        self.fake.its["audit lnd --repair"] = (1, self.audit("not_checked"))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, "clean"), (doc["exit_code"], doc["removed"], doc["at_rest"]), doc)
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
+        self.assertNotIn("remove_pending", mod.load_state(self.deps))
+
+
+class TestMenu(ModuleTestCase):
+    """The menu entries (menu_choices) and its START and RESTART action (menu_start); the dialog
+    loop around them is interactive and not covered."""
+
+    def setUp(self):
+        super().setUp()
+        self.store()
+        self.activate_conf()
+
+    def tags(self):
+        return [tag for tag, _text in mod.menu_choices(self.deps, mod.load_state(self.deps),
+                                                       mod.read_rb_conf(self.deps))[0]]
+
+    def test_start_and_restart_only_while_tunnelsats_is_on(self):
+        self.fake.units["lnd.service"]["ActiveState"] = "inactive"
+        self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE", "START"], self.tags())
+        self.fake.units["lnd.service"]["ActiveState"] = "active"
+        self.record(decision="tor-only", reason="emergency_block")
+        self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE", "RESTART"], self.tags())
+        self.fake.conf_set("tunnelsats", "off")
+        for active in ("inactive", "failed", "active"):
+            self.fake.units["lnd.service"]["ActiveState"] = active
+            self.assertEqual(["STATUS", "CHECK", "REPAIR", "REMOVE"], self.tags())
+
+    def test_menu_start_only_while_tunnelsats_is_on(self):
+        self.fake.conf_set("tunnelsats", "off")
+        self.assertIsNone(mod.menu_start(self.deps))
+        self.assertEqual([], self.fake.calls_of("systemctl", "start"))
+        self.fake.conf_set("tunnelsats", "on")
+        self.assertEqual("lnd", mod.menu_start(self.deps))
+        self.assertEqual("lnd", mod.menu_start(self.deps, restart=True))
+        self.assertEqual([["systemctl", "start", "lnd.service"], ["systemctl", "restart", "lnd.service"]],
+                         self.fake.calls_of("systemctl", "start") + self.fake.calls_of("systemctl", "restart"))
+
+    def test_without_a_subscription(self):
+        shutil.rmtree(self.path(mod.STATE_DIR))
+        choices, notice = mod.menu_choices(self.deps, None, mod.read_rb_conf(self.deps), {"adopt_available": True})
+        self.assertEqual((["IMPORT", "ADOPT", "ABOUT"], None), ([tag for tag, _text in choices], notice))
+
 
 class TestAdopt(ModuleTestCase):
     def snapshot(self):
