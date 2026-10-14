@@ -822,6 +822,16 @@ def cmd_detect(deps, args, result):
 # Activation (shared by IMPORT and REPAIR)
 # ------------------------------------------------------------------------------------------
 
+def guard_line(impl):
+    """The start guard line of a mainnet Lightning unit (the templates write the same text): it runs
+    the guard, or, without an executable internet.tunnelsats.sh, writes the empty value (never a
+    deleted file, so a stray raspiblitz.conf value cannot pass) and lets Lightning start Tor-only."""
+    return ("ExecStartPre=+/bin/sh -c 'if [ -x {its} ]; then exec {its} guard {impl} mainnet; fi; "
+            "echo tunnelsats-guard: internet.tunnelsats.sh is missing, Lightning starts Tor-only >&2; "
+            "mkdir -p /run/tunnelsats && echo {var}= > /run/tunnelsats/hybrid-{base}.env'").format(
+                its=ITS, impl=impl, var=VARS[impl], base=BASES[impl])
+
+
 def unit_template_ok(deps, impl):
     """The Lightning unit file carries the guard template lines and needs no daemon-reload."""
     unit = UNITS[impl]
@@ -839,7 +849,7 @@ def unit_template_ok(deps, impl):
         return False
     if "EnvironmentFile=-/run/tunnelsats/hybrid-%s.env" % BASES[impl] not in lines:
         return False
-    if "ExecStartPre=+%s guard %s mainnet" % (ITS, impl) not in lines:
+    if guard_line(impl) not in lines:
         return False
     starts = [line for line in lines if line.startswith("ExecStart=")]
     if impl == "lnd":

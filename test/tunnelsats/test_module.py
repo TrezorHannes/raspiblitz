@@ -590,6 +590,24 @@ class TestImport(ModuleTestCase):
 # REMOVE, ADOPT, REPAIR
 # ------------------------------------------------------------------------------------------
 
+class TestTemplates(unittest.TestCase):
+    def test_guard_line_is_the_line_the_unit_templates_write(self):
+        with open(os.path.join(REPO, "home.admin", "assets", "lnd.service")) as handle:
+            self.assertIn(mod.guard_line("lnd"), handle.read().splitlines())
+        with open(os.path.join(REPO, "home.admin", "config.scripts", "cl.install-service.sh")) as handle:
+            lines = [line for line in handle.read().splitlines() if line.startswith("ExecStartPre=+")]
+        self.assertEqual(1, len(lines))
+        rendered = lines[0].replace("$CHAIN", "mainnet").replace("${netprefix}", "")
+        # nothing else in the line for bash (echo "...") or systemd to expand
+        self.assertFalse(any(ch in rendered for ch in "$%\\`"), rendered)
+        self.assertEqual(mod.guard_line("cl"), rendered)
+        for impl in mod.IMPLS:
+            self.assertIn("if [ -x %s ]; then exec %s guard %s mainnet; fi;" % (mod.ITS, mod.ITS, impl),
+                          mod.guard_line(impl))
+            self.assertTrue(mod.guard_line(impl).endswith(
+                "echo %s= > /run/tunnelsats/hybrid-%s.env'" % (mod.VARS[impl], mod.BASES[impl])))
+
+
 class TestRemove(ModuleTestCase):
     def setUp(self):
         super().setUp()

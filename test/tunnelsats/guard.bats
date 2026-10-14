@@ -6,6 +6,8 @@
 # Variables set here are read by the sourced production functions.
 # shellcheck disable=SC2034
 
+bats_require_minimum_version 1.5.0
+
 load helpers
 
 setup() {
@@ -714,4 +716,42 @@ EOF
     chmod 0666 "${TS_RB_RUN_DIR}/dev-override.sha256"
     run call its_cmd_guard lnd mainnet
     assert_decision tor-only tool_untrusted
+}
+
+# The sh code of the template guard line (assets/lnd.service), with the run directory and the script
+# path moved into the fixture tree. $1 = path the code checks for the script.
+template_guard_code() {
+    local line code
+    line=$(grep -m 1 -F -e 'ExecStartPre=+/bin/sh -c ' -- "${BATS_TEST_DIRNAME}/../../home.admin/assets/lnd.service")
+    code="${line#*-c \'}"
+    code="${code%\'}"
+    # systemd passes the quoted code to sh unchanged only without $, % and backslash
+    [[ "$code" != *[\$%\\]* ]] || return 1
+    code="${code//\/home\/admin\/config.scripts\/internet.tunnelsats.sh/$1}"
+    printf '%s' "${code//\/run\/tunnelsats/${FX}/runts}"
+}
+
+@test "template guard line: the script runs if present; without it the empty value is written and the start goes on" {
+    local code
+    printf '#!/bin/bash\nprintf "%%s\\n" "$*" > %q\nexit 7\n' "$FX/guard.args" > "$FX/its-stub"
+    chmod 0755 "$FX/its-stub"
+    code=$(template_guard_code "$FX/its-stub")
+    run sh -c "$code"
+    [ "$status" -eq 7 ]
+    [ "$(cat "$FX/guard.args")" = "guard lnd mainnet" ]
+    [ ! -e "$FX/runts" ]
+    code=$(template_guard_code "$FX/its-missing")
+    run --separate-stderr sh -c "$code"
+    [ "$status" -eq 0 ]
+    [ "$stderr" = "tunnelsats-guard: internet.tunnelsats.sh is missing, Lightning starts Tor-only" ]
+    [ "$(cat "$FX/runts/hybrid-lnd.env")" = "TUNNELSATS_LND_ARGS=" ]
+    printf 'TUNNELSATS_LND_ARGS=--stale-flag\n' > "$FX/runts/hybrid-lnd.env"
+    run sh -c "$code"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$FX/runts/hybrid-lnd.env")" = "TUNNELSATS_LND_ARGS=" ]
+    skip_if_root
+    chmod 0444 "$FX/runts/hybrid-lnd.env"
+    chmod 0555 "$FX/runts"
+    run sh -c "$code"
+    [ "$status" -ne 0 ]
 }

@@ -13,8 +13,10 @@
 #   ExecStartPre=+<smoke/pre.sh>         production its_guard_init, its_render, its_guard_write_env
 #   ExecStart=<argv> $VAR                LND form; CLN form: /bin/sh -c '<argv> $$VAR'
 #   User=nobody
-# A third unit runs the real script (a byte copy, guard lnd mainnet) on this host, where
-# TunnelSats is off.
+# The other units carry the guard line of the templates verbatim (assets/lnd.service, and
+# cl.install-service.sh rendered for mainnet): once with a byte copy of the real script on this
+# host, where TunnelSats is off, and once with the script missing (older code after a PATCH), where
+# Lightning must start Tor-only with the empty value written over any stale flags.
 #
 # Usage: sudo test/tunnelsats/systemd_smoke.sh
 # Exit 0: all checks passed, 1: a check failed, 2: cannot run here.
@@ -26,11 +28,14 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="${HERE}/../../home.admin/config.scripts/internet.tunnelsats.sh"
+ASSET="${HERE}/../../home.admin/assets/lnd.service"
+CL_WRITER="${HERE}/../../home.admin/config.scripts/cl.install-service.sh"
+PROD_SCRIPT="/home/admin/config.scripts/internet.tunnelsats.sh"
 LIB="/usr/local/lib/ts-smoke"
 UNIT_DIR="/run/systemd/system"
 PROD_RUN="/run/tunnelsats"
 PROD_CONF="/mnt/hdd/app-data/raspiblitz.conf"
-UNITS=(ts-smoke-lnd ts-smoke-cl ts-smoke-real)
+UNITS=(ts-smoke-lnd ts-smoke-cl ts-smoke-real ts-smoke-missing-lnd ts-smoke-missing-cl)
 # what pre.sh renders for the endpoint of the verify fixtures
 LND_WORDS=(--tor.skip-proxy-for-clearnet-targets --externalhosts=de2.tunnelsats.com:24556)
 CLN_WORDS=(--bind-addr=0.0.0.0:9735 --announce-addr=1.2.3.4:24556 --always-use-proxy=false
@@ -175,9 +180,62 @@ real_cases() {
         grep -q '"decision":"noop","reason":"tunnelsats_off"' "${PROD_RUN}/guard-lnd.json"
 }
 
+# The guard script is missing (older code after a PATCH): the template line must let Lightning start
+# Tor-only and write the empty value, over a stale flags file too, so no stray value passes.
+missing_cases() {
+    local lnd_env="${PROD_RUN}/hybrid-lnd.env" cl_env="${PROD_RUN}/hybrid-lightningd.env"
+    if [[ -e "$PROD_SCRIPT" ]] || [[ -e "$PROD_CONF" ]]; then
+        echo "skip - missing script: ${PROD_SCRIPT} or ${PROD_CONF} exists, this is not a throwaway host"
+        if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+            FAILED=$((FAILED + 1))
+        fi
+        return 0
+    fi
+    # the run directory is ours (real_cases created it, or nothing did): start without it
+    if [[ -e "$PROD_RUN" ]] && [[ "$CREATED_PROD_RUN" -ne 1 ]]; then
+        echo "skip - missing script: ${PROD_RUN} exists and is not ours"
+        FAILED=$((FAILED + 1))
+        return 0
+    fi
+    rm -rf -- "$PROD_RUN"
+    CREATED_PROD_RUN=1
+    printf 'TUNNELSATS_LND_ARGS=--stray-flag\n' > "${WORK}/stray-missing.env"
+    printf 'TUNNELSATS_CLN_ARGS=--stray-flag\n' >> "${WORK}/stray-missing.env"
+
+    check "missing, LND: start without the script and without ${PROD_RUN}" start_unit ts-smoke-missing-lnd
+    check "missing, LND: no argument, the stray value stays out" argv_is "${WORK}/out/missing-lnd.argv" "$NOBODY_UID"
+    check "missing, LND: the empty value is written" file_is "$lnd_env" "TUNNELSATS_LND_ARGS="
+    check "missing, LND: env file and run directory are root 0644 and 0755" \
+        test "$(stat -c '%u %a' -- "$lnd_env") $(stat -c '%u %a' -- "$PROD_RUN")" = "0 644 0 755"
+
+    printf 'TUNNELSATS_LND_ARGS=--stale-flag\n' > "$lnd_env"
+    rm -f -- "${WORK}/out/missing-lnd.argv"
+    check "missing, LND: start with a stale flags file" start_unit ts-smoke-missing-lnd
+    check "missing, LND: the stale file now holds the empty value" file_is "$lnd_env" "TUNNELSATS_LND_ARGS="
+    check "missing, LND: no argument (the stale flag stays out)" argv_is "${WORK}/out/missing-lnd.argv" "$NOBODY_UID"
+
+    printf 'TUNNELSATS_CLN_ARGS=--stale-flag\n' > "$cl_env"
+    check "missing, CLN: start with a stale flags file" start_unit ts-smoke-missing-cl
+    check "missing, CLN: the stale file now holds the empty value" file_is "$cl_env" "TUNNELSATS_CLN_ARGS="
+    check "missing, CLN: no argument (the stale flag stays out)" argv_is "${WORK}/out/missing-cl.argv" "$NOBODY_UID"
+}
+
+# The CLN writer's guard line as its echo "..." writes it for mainnet (no restart, no root needed).
+cl_guard_line() {
+    local line
+    line=$(grep -m 1 -F -e 'ExecStartPre=+/bin/sh -c ' -- "$CL_WRITER") || return 1
+    # the variables are read by the expansion inside eval
+    # shellcheck disable=SC2034
+    local CHAIN="mainnet" netprefix=""
+    eval "printf '%s\n' \"${line}\""
+}
+
 trap cleanup EXIT
 cleanup   # leftovers of an aborted run
 
+LND_GUARD_LINE="$(grep -m 1 -F -e 'ExecStartPre=+/bin/sh -c ' -- "$ASSET")"
+CL_GUARD_LINE="$(cl_guard_line)"
+REAL_GUARD_LINE="${LND_GUARD_LINE//"$PROD_SCRIPT"/"${LIB}/internet.tunnelsats.sh"}"
 WORK="$(mktemp -d /run/ts-smoke.XXXXXX)"
 chmod 0755 "$WORK"
 install -d -m 0755 "${WORK}/run" "${WORK}/ctl"
@@ -222,7 +280,7 @@ EOF
 
 cat > "${UNIT_DIR}/ts-smoke-real.service" <<EOF
 [Unit]
-Description=TunnelSats smoke test (real guard, TunnelSats off)
+Description=TunnelSats smoke test (real guard through the template line, TunnelSats off)
 
 [Service]
 Type=oneshot
@@ -232,15 +290,51 @@ Environment=TS_SMOKE_OUT=${WORK}/out/real.argv
 Environment=TS_RB_RUN_DIR=${WORK}/redirect TS_RB_CONF=${WORK}/redirect.conf
 Environment=TUNNELSATS_LND_ARGS=
 EnvironmentFile=-${PROD_RUN}/hybrid-lnd.env
-ExecStartPre=+${LIB}/internet.tunnelsats.sh guard lnd mainnet
+${REAL_GUARD_LINE}
 ExecStart=${LIB}/argv \$TUNNELSATS_LND_ARGS
+EOF
+
+cat > "${UNIT_DIR}/ts-smoke-missing-lnd.service" <<EOF
+[Unit]
+Description=TunnelSats smoke test (guard script missing, LND template line)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60
+User=nobody
+Environment=TS_SMOKE_OUT=${WORK}/out/missing-lnd.argv
+EnvironmentFile=-${WORK}/stray-missing.env
+Environment=TUNNELSATS_LND_ARGS=
+EnvironmentFile=-${PROD_RUN}/hybrid-lnd.env
+${LND_GUARD_LINE}
+ExecStart=${LIB}/argv \$TUNNELSATS_LND_ARGS
+EOF
+
+cat > "${UNIT_DIR}/ts-smoke-missing-cl.service" <<EOF
+[Unit]
+Description=TunnelSats smoke test (guard script missing, CLN template line)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=60
+User=nobody
+Environment=TS_SMOKE_OUT=${WORK}/out/missing-cl.argv
+EnvironmentFile=-${WORK}/stray-missing.env
+Environment=TUNNELSATS_CLN_ARGS=
+EnvironmentFile=-${PROD_RUN}/hybrid-lightningd.env
+${CL_GUARD_LINE}
+ExecStart=/bin/sh -c '${LIB}/argv \$\$TUNNELSATS_CLN_ARGS'
 EOF
 
 systemctl daemon-reload
 
+check "the LND template guard line was found in assets/lnd.service" test -n "$LND_GUARD_LINE"
+check "the CLN template guard line was rendered from cl.install-service.sh" test -n "$CL_GUARD_LINE"
+check "the real unit's guard line points at the byte copy" test "$REAL_GUARD_LINE" != "$LND_GUARD_LINE"
 form_cases lnd ts-smoke-lnd lnd TUNNELSATS_LND_ARGS "${LND_WORDS[@]}"
 form_cases cl ts-smoke-cl lightningd TUNNELSATS_CLN_ARGS "${CLN_WORDS[@]}"
 real_cases
+missing_cases
 
 version="$(systemctl --version 2>/dev/null | sed -n '1s/^systemd \([0-9]*\).*/\1/p')" || version="?"
 echo "systemd smoke (systemd ${version}): ${PASSED} passed, ${FAILED} failed"
