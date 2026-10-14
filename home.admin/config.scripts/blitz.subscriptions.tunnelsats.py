@@ -67,7 +67,7 @@ CL_INSTALL_SERVICE = "/home/admin/config.scripts/cl.install-service.sh"
 LND_UNLOCK = "/home/admin/config.scripts/lnd.unlock.sh"
 CL_HSMTOOL = "/home/admin/config.scripts/cl.hsmtool.sh"
 UNIT_DIR = "/etc/systemd/system"
-LEGACY_CONF_RE = re.compile(r"^/etc/wireguard/[A-Za-z0-9_.-]{1,64}\.conf$")
+LEGACY_CONF_RE = re.compile(r"/etc/wireguard/[A-Za-z0-9_.-]{1,64}\.conf")
 
 API_STATUS_URL = "https://tunnelsats.com/api/public/v1/subscription/status"
 API_CONNECT_TIMEOUT = 15
@@ -86,19 +86,20 @@ RESTARTABLE = ("emergency_block", "verify_timeout", "verify_unsafe", "verify_fai
 RESTART_MESSAGE = ("TunnelSats: the tunnel is ready again. Restart Lightning to resume clearnet connections "
                    "(SSH menu > SUBSCRIBE > TunnelSats).")
 
-KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
-HOST_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+tunnelsats\.com$")
-ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$")
-SECTION_RE = re.compile(r"^\[([A-Za-z]+)\]$")
-KV_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)$")
-PORT_COMMENT_RE = re.compile(r"^#\s*(?:Port Forwarding\s*:|VPNPort\s*=)\s*(\S+)\s*$", re.IGNORECASE)
-VALID_UNTIL_RE = re.compile(r"^#\s*Valid Until\s*:\s*(\S+)\s*$", re.IGNORECASE)
-MYPUBKEY_RE = re.compile(r"^#\s*myPubKey\s*:\s*(\S+)\s*$", re.IGNORECASE)
+# Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
+KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
+HOST_RE = re.compile(r"([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+tunnelsats\.com")
+ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})")
+SECTION_RE = re.compile(r"\[([A-Za-z]+)\]")
+KV_RE = re.compile(r"([A-Za-z][A-Za-z0-9]*)\s*=\s*(.*)")
+PORT_COMMENT_RE = re.compile(r"#\s*(?:Port Forwarding\s*:|VPNPort\s*=)\s*(\S+)\s*", re.IGNORECASE)
+VALID_UNTIL_RE = re.compile(r"#\s*Valid Until\s*:\s*(\S+)\s*", re.IGNORECASE)
+MYPUBKEY_RE = re.compile(r"#\s*myPubKey\s*:\s*(\S+)\s*", re.IGNORECASE)
 DROPPED_KEYS = ("dns", "postup", "postdown", "preup", "predown", "table", "fwmark", "saveconfig", "listenport")
 MAX_CONFIG_BYTES = 16384
 
-LND_FLAG_RE = re.compile(r"^--(tor\.skip-proxy-for-clearnet-targets(=.*)?|externalhosts=.*)$")
-CLN_FLAG_RE = re.compile(r"^--(bind-addr=0\.0\.0\.0:9735|always-use-proxy=false|announce-addr-discovered=false|announce-addr=(?!.*\.onion).*)$")
+LND_FLAG_RE = re.compile(r"--(tor\.skip-proxy-for-clearnet-targets(=.*)?|externalhosts=.*)")
+CLN_FLAG_RE = re.compile(r"--(bind-addr=0\.0\.0\.0:9735|always-use-proxy=false|announce-addr-discovered=false|announce-addr=(?!.*\.onion).*)")
 
 
 class ModuleError(Exception):
@@ -180,7 +181,7 @@ def now_iso(deps):
 
 def parse_iso(value):
     """Returns an aware datetime for an ISO-8601 string, or None."""
-    if not isinstance(value, str) or not ISO_RE.match(value):
+    if not isinstance(value, str) or not ISO_RE.fullmatch(value):
         return None
     text = value[:-1] + "+00:00" if value.endswith("Z") else value
     frac = re.search(r"\.(\d+)", text)
@@ -193,7 +194,7 @@ def parse_iso(value):
 
 
 def valid_host(host):
-    return isinstance(host, str) and len(host) <= 253 and HOST_RE.match(host) is not None
+    return isinstance(host, str) and len(host) <= 253 and HOST_RE.fullmatch(host) is not None
 
 
 def valid_port(port):
@@ -229,7 +230,7 @@ def read_rb_conf(deps):
     except OSError:
         return values
     for line in lines:
-        match = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line.rstrip("\r"))
+        match = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)=(.*)", line.rstrip("\r"))
         if not match:
             continue
         value = match.group(2)
@@ -385,14 +386,14 @@ def parse_wg_config(data):
             continue
         if line.startswith("#"):
             for regex, label in ((PORT_COMMENT_RE, "port"), (VALID_UNTIL_RE, "valid"), (MYPUBKEY_RE, "pub")):
-                match = regex.match(line)
+                match = regex.fullmatch(line)
                 if not match:
                     continue
                 value = match.group(1)
                 if label == "port":
                     if port is not None:
                         raise _invalid("E_CONFIG_INVALID", "line %d: a second port comment" % number)
-                    if not re.match(r"^[1-9][0-9]{0,4}$", value) or int(value) > 65535:
+                    if not re.fullmatch(r"[1-9][0-9]{0,4}", value) or int(value) > 65535:
                         raise _invalid("E_CONFIG_NO_PORT", "line %d: the port comment is not a port number" % number)
                     port = int(value)
                 elif label == "valid":
@@ -408,7 +409,7 @@ def parse_wg_config(data):
                     mypubkey = value
                 break
             continue
-        section = SECTION_RE.match(line)
+        section = SECTION_RE.fullmatch(line)
         if section:
             name = section.group(1).lower()
             if name not in ("interface", "peer"):
@@ -420,7 +421,7 @@ def parse_wg_config(data):
             continue
         if "#" in line:
             line = line.split("#", 1)[0].rstrip()
-        match = KV_RE.match(line)
+        match = KV_RE.fullmatch(line)
         if not match or current is None:
             raise _invalid("E_CONFIG_INVALID", "line %d is not a key = value line inside a section" % number)
         key = match.group(1).lower()
@@ -446,7 +447,7 @@ def parse_wg_config(data):
         return entries[key]
 
     number, private_key, _ = required(iface, "privatekey", "PrivateKey")
-    if not KEY_RE.match(private_key):
+    if not KEY_RE.fullmatch(private_key):
         raise _invalid("E_CONFIG_INVALID", "line %d: PrivateKey is not a WireGuard key" % number)
     number, address_text, _ = required(iface, "address", "Address")
     addresses = []
@@ -460,30 +461,33 @@ def parse_wg_config(data):
             continue
         if interface.ip not in ipaddress.ip_network("10.0.0.0/8"):
             raise _invalid("E_CONFIG_INVALID", "line %d: Address must be inside 10.0.0.0/8" % number)
+        if interface.network.prefixlen != 32:
+            # TunnelSats issues one /32; a wider prefix would add an on-link route on the tunnel
+            raise _invalid("E_CONFIG_INVALID", "line %d: Address must be a single /32 address" % number)
         addresses.append(str(interface))
     if not addresses:
         raise _invalid("E_CONFIG_INVALID", "line %d: Address has no IPv4 entry" % number)
     mtu = None
     if "mtu" in iface:
         number, value, _ = iface["mtu"]
-        if not re.match(r"^[0-9]{4}$", value) or not 1280 <= int(value) <= 1500:
+        if not re.fullmatch(r"[0-9]{4}", value) or not 1280 <= int(value) <= 1500:
             raise _invalid("E_CONFIG_INVALID", "line %d: MTU must be 1280-1500" % number)
         mtu = int(value)
     number, peer_key, _ = required(peer, "publickey", "PublicKey")
-    if not KEY_RE.match(peer_key):
+    if not KEY_RE.fullmatch(peer_key):
         raise _invalid("E_CONFIG_INVALID", "line %d: PublicKey is not a WireGuard key" % number)
     psk = None
     if "presharedkey" in peer:
         number, psk, _ = peer["presharedkey"]
-        if not KEY_RE.match(psk):
+        if not KEY_RE.fullmatch(psk):
             raise _invalid("E_CONFIG_INVALID", "line %d: PresharedKey is not a WireGuard key" % number)
     number, endpoint, _ = required(peer, "endpoint", "Endpoint")
-    match = re.match(r"^(.+):([0-9]{1,5})$", endpoint)
+    match = re.fullmatch(r"(.+):([0-9]{1,5})", endpoint)
     if not match:
         raise _invalid("E_CONFIG_INVALID", "line %d: Endpoint is not host:port" % number)
     host = match.group(1).lower()
     endpoint_port = int(match.group(2))
-    if host.startswith("[") or re.match(r"^[0-9.]+$", host):
+    if host.startswith("[") or re.fullmatch(r"[0-9.]+", host):
         raise ModuleError("E_ENDPOINT_NOT_ALLOWED", "refused",
                           "line %d: Endpoint must be a *.tunnelsats.com host name, not an IP address" % number,
                           EXIT_USAGE)
@@ -504,7 +508,7 @@ def parse_wg_config(data):
     keepalive = None
     if "persistentkeepalive" in peer:
         number, value, _ = peer["persistentkeepalive"]
-        if not re.match(r"^[0-9]{1,5}$", value) or int(value) > 65535:
+        if not re.fullmatch(r"[0-9]{1,5}", value) or int(value) > 65535:
             raise _invalid("E_CONFIG_INVALID", "line %d: PersistentKeepalive must be 0-65535" % number)
         keepalive = int(value)
     public_key = public_key_of(private_key)
@@ -547,7 +551,7 @@ def render_wg_config(cfg):
 def _api_error_code(raw):
     doc = parse_one_json(raw.decode("utf-8", "replace")) if raw else None
     code = doc.get("error") if doc else None
-    return code if isinstance(code, str) and re.match(r"^ERR_[A-Z0-9_]{1,40}$", code) else None
+    return code if isinstance(code, str) and re.fullmatch(r"ERR_[A-Z0-9_]{1,40}", code) else None
 
 
 def validate_status(doc):
@@ -881,7 +885,7 @@ def map_tool_exit(rc):
 def tool_error(doc, fallback):
     errors = (doc or {}).get("errors") or []
     code = errors[0].get("code") if errors and isinstance(errors[0], dict) else None
-    return code if isinstance(code, str) and re.match(r"^E_[A-Z0-9_]{1,40}$", code) else fallback
+    return code if isinstance(code, str) and re.fullmatch(r"E_[A-Z0-9_]{1,40}", code) else fallback
 
 
 def activate(deps, impl, result, stored_writer=None):
@@ -1084,7 +1088,7 @@ def cmd_adopt(deps, args, result):
     if kind == "managed":
         raise ModuleError("E_ALREADY_MANAGED", "refused", "TunnelSats already runs in managed mode", EXIT_REFUSED)
     path = (tool.get("config") or {}).get("path")
-    if not isinstance(path, str) or not LEGACY_CONF_RE.match(path):
+    if not isinstance(path, str) or not LEGACY_CONF_RE.fullmatch(path):
         raise ModuleError("E_CONFIG_NOT_FOUND", "operational", "the legacy WireGuard config was not found",
                           EXIT_OPERATIONAL)
     try:
@@ -1229,7 +1233,7 @@ def daemon_cmdline(deps, unit):
 
 def has_flags(impl, args):
     regex = LND_FLAG_RE if impl == "lnd" else CLN_FLAG_RE
-    return any(regex.match(a) for a in (args or []))
+    return any(regex.fullmatch(a) for a in (args or []))
 
 
 def lightning_info(deps, impl):

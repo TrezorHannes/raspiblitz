@@ -326,10 +326,32 @@ class TestParser(unittest.TestCase):
             (lambda t: t.replace("Address", "Address\x1b[31m"), "E_CONFIG_INVALID"),
             (lambda t: t.encode().replace(b"Address", b"Addr\xffess"), "E_CONFIG_INVALID"),
             (lambda t: t.replace("PersistentKeepalive = 25", "PersistentKeepalive = 99999"), "E_CONFIG_INVALID"),
+            (lambda t: t.replace("Address = 10.9.0.42/32", "Address = 10.0.0.1/1"), "E_CONFIG_INVALID"),
+            (lambda t: t.replace("Address = 10.9.0.42/32", "Address = 10.9.0.42/24"), "E_CONFIG_INVALID"),
+            (lambda t: t.replace("Address = 10.9.0.42/32", "Address = 10.9.0.42/32, 10.9.0.43/31"), "E_CONFIG_INVALID"),
         ]
         for transform, code in cases:
             with self.subTest(code=code):
                 self.hostile(transform, code)
+
+    def test_a_bare_address_counts_as_a_single_host(self):
+        cfg = mod.parse_wg_config(fixture("import", "website.conf").replace(
+            "Address = 10.9.0.42/32", "Address = 10.9.0.42").encode())
+        self.assertEqual(["10.9.0.42/32"], cfg["addresses"])
+
+    def test_validators_reject_a_trailing_newline(self):
+        self.assertTrue(mod.valid_host("de2.tunnelsats.com"))
+        self.assertFalse(mod.valid_host("de2.tunnelsats.com\n"))
+        status = fixture_json("api", "status_enabled.json")
+        self.assertIsNotNone(mod.validate_status(status))
+        status["server_domain"] += "\n"
+        self.assertIsNone(mod.validate_status(status))
+        self.assertIsNone(mod.parse_iso("2026-10-14T12:00:00Z\n"))
+        self.assertIsNone(mod.KEY_RE.fullmatch(ALICE_PRIV + "\n"))
+        self.assertEqual("E_FALLBACK", mod.tool_error({"errors": [{"code": "E_TIMEOUT\n"}]}, "E_FALLBACK"))
+        self.assertIsNone(mod._api_error_code(b'{"error": "ERR_RATE_LIMIT\\n"}'))
+        self.assertFalse(mod.has_flags("lnd", ["--tor.skip-proxy-for-clearnet-targetsX"]))
+        self.assertTrue(mod.has_flags("lnd", ["--externalhosts=de2.tunnelsats.com:24556"]))
 
     def test_hooks_and_dns_are_dropped_with_warnings_never_copied(self):
         text = fixture("import", "website.conf").replace(
