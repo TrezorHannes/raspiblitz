@@ -626,6 +626,87 @@ class TestRemove(ModuleTestCase):
         self.assertEqual([], self.fake.calls_of("systemctl", "enable"))
         self.assertEqual([], self.fake.calls_of("systemctl", "start"))
 
+    @staticmethod
+    def audit(status, reason=None, lines=(), keys=()):
+        return {"contract": 1, "command": "its.audit", "status": status, "reason": reason, "keys": list(keys),
+                "lines": list(lines), "eligible": True}
+
+    def assert_stays_stopped(self, doc):
+        self.assertEqual((1, "E_AT_REST_UNREPAIRABLE"), (doc["exit_code"], doc["errors"][0]["code"]), doc)
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable"))
+        self.assertEqual([], self.fake.calls_of("systemctl", "start"))
+        self.assertFalse(doc["removed"] or doc["ln_reenabled"] or doc["ln_started"])
+
+    def test_unrepairable_at_rest_audit_keeps_lightning_stopped_and_names_the_lines(self):
+        line = "/mnt/hdd/app-data/lnd/lnd.conf:8:externalhosts=de2.tunnelsats.com:24556"
+        self.fake.its["audit lnd --repair"] = (1, self.audit("unrepairable", "backup_failed", [line], ["externalhosts"]))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stays_stopped(doc)
+        action = doc["action_required"]
+        self.assertEqual(("node_config_clearnet", [line], "systemctl enable --now lnd.service"),
+                         (action["reason"], action["lines"], action["then"]))
+        self.assertIn("backup_failed", action["detail"])
+        self.assertIn("lnd.service stays stopped and disabled", doc["errors"][0]["message"])
+        self.assertIn("then run: sudo systemctl enable --now lnd.service", doc["errors"][0]["message"])
+        text = mod.result_text(doc)
+        self.assertIn(line, text)
+        self.assertIn("Then run: sudo systemctl enable --now lnd.service", text)
+        self.assertTrue(os.path.exists(self.path(mod.CONF_FILE)))
+
+    def test_an_at_rest_audit_without_answer_keeps_lightning_stopped(self):
+        self.fake.its["audit lnd --repair"] = (124, "")
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stays_stopped(doc)
+        self.assertIsNone(doc["at_rest"])
+        self.assertEqual(("node_config_unknown", []), (doc["action_required"]["reason"], doc["action_required"]["lines"]))
+        self.assertIn("did not answer", doc["action_required"]["detail"])
+
+    def test_a_running_unit_gets_the_read_only_check(self):
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+        uninstall.update({"ln_disabled": False, "ln_started": True, "node_config": "clean", "action_required": None})
+        self.fake.its["uninstall"] = (0, uninstall)
+        self.fake.its["audit lnd --repair"] = (1, self.audit("not_checked"))
+        line = "/mnt/hdd/app-data/lnd/lnd.conf:27:tor.skip-proxy-for-clearnet-targets=true"
+        self.fake.its["audit lnd"] = (4, self.audit("drift", None, [line], ["tor.skip-proxy-for-clearnet-targets"]))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((1, "drift"), (doc["exit_code"], doc["at_rest"]))
+        self.assertEqual(([line], None), (doc["action_required"]["lines"], doc["action_required"]["then"]))
+        self.assertIn([mod.ITS, "audit", "lnd", "--json"], self.fake.calls)
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
+
+    def test_a_running_unit_with_a_clean_config_completes(self):
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+        uninstall.update({"ln_disabled": False, "ln_started": True, "node_config": "clean", "action_required": None})
+        self.fake.its["uninstall"] = (0, uninstall)
+        self.fake.its["audit lnd --repair"] = (1, self.audit("not_checked"))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, "clean", True), (doc["exit_code"], doc["at_rest"], doc["removed"]), doc)
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
+
+    def test_the_other_implementation_is_checked_and_never_edited(self):
+        line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
+        self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((1, "E_AT_REST_UNREPAIRABLE"), (doc["exit_code"], doc["errors"][0]["code"]))
+        # the tunneled unit itself is Tor-only at rest: it is enabled and started again
+        self.assertTrue(doc["ln_reenabled"] and doc["ln_started"])
+        self.assertEqual(([line], None), (doc["action_required"]["lines"], doc["action_required"]["then"]))
+        self.assertIn("lightningd.service", doc["errors"][0]["message"])
+        self.assertEqual([], self.fake.calls_of(mod.ITS, "audit", "cl", "--repair"))
+
+    def test_the_unit_of_the_uninstall_document_decides_which_config_is_audited(self):
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+        uninstall["unit"] = "lightningd.service"
+        self.fake.its["uninstall"] = (0, uninstall)
+        line = "/home/bitcoin/.lightning/extra.conf:2:announce-addr=203.0.113.5:9735"
+        self.fake.its["audit cl --repair"] = (1, self.audit("unrepairable", "include_hybrid", [line], ["announce-addr"]))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stays_stopped(doc)
+        self.assertIn([mod.ITS, "audit", "cl", "--repair", "--json"], self.fake.calls)
+        self.assertEqual([], self.fake.calls_of(mod.ITS, "audit", "lnd", "--repair"))
+        self.assertEqual(([line], "systemctl enable --now lightningd.service"),
+                         (doc["action_required"]["lines"], doc["action_required"]["then"]))
+
     def test_purge_deletes_the_stored_subscription(self):
         doc = self.run_verb("uninstall", "--yes", "--purge")
         self.assertTrue(doc["purged"])

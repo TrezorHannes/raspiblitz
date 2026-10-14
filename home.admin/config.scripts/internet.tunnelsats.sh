@@ -313,10 +313,11 @@ its_read_lines() {
 }
 
 # Scans an included CLN config (path $1 as written, relative to directory $2) and the files it
-# includes. Sets AS_INC_FAIL (include_unreadable or include_hybrid) and the presence flags.
+# includes. Sets AS_INC_FAIL (the first of include_unreadable and include_hybrid), adds every
+# clearnet line found to AS_HITS (<file>:<line>:<setting>) and sets the presence flags.
 its_cln_scan_includes() {
     local -a queue=() seen=()
-    local entry path dir depth resolved line s inc
+    local entry path dir depth resolved line s inc num
     queue=("0|$2|$1")
     while [[ ${#queue[@]} -gt 0 ]]; do
         entry="${queue[0]}"
@@ -328,14 +329,16 @@ its_cln_scan_includes() {
         [[ "$path" == /* ]] || path="${dir}/${path}"
         resolved=$(readlink -f -- "$path" 2>/dev/null) || resolved=""
         if [[ -z "$resolved" ]] || [[ ! -f "$resolved" ]] || [[ ! -r "$resolved" ]] || [[ "$depth" -gt 4 ]]; then
-            AS_INC_FAIL="include_unreadable"
-            return 0
+            [[ -n "$AS_INC_FAIL" ]] || AS_INC_FAIL="include_unreadable"
+            continue
         fi
         for s in "${seen[@]}"; do
             [[ "$s" == "$resolved" ]] && continue 2
         done
         seen+=("$resolved")
+        num=0
         while IFS= read -r line || [[ -n "$line" ]]; do
+            num=$((num + 1))
             line="${line%$'\r'}"
             line="${line#"${line%%[![:space:]]*}"}"
             if [[ "$line" =~ ^include([[:space:]]+|=)(.+)$ ]]; then
@@ -346,8 +349,9 @@ its_cln_scan_includes() {
             fi
             its_cfg_parse "$line" || continue
             if its_cln_hit; then
-                AS_INC_FAIL="include_hybrid"
-                return 0
+                AS_HITS+=("${resolved}:${num}:${line}")
+                [[ -n "$AS_INC_FAIL" ]] || AS_INC_FAIL="include_hybrid"
+                continue
             fi
             its_cln_presence
         done < "$resolved"
@@ -366,13 +370,14 @@ its_cln_presence() {
 }
 
 # Scans config $2 of implementation $1 (lnd|cl). Sets AS_ACTION (per line: delete, replace or
-# empty), AS_KEYS (clearnet keys found), AS_APPEND_AUP (CLN: always-use-proxy=true is missing),
-# AS_FAIL (why the config cannot be made Tor-only by the guard) and the eligibility result
-# AS_ELIGIBLE/AS_NE_REASON. Read-only.
+# empty), AS_KEYS (clearnet keys found), AS_HITS (every clearnet line as <file>:<line>:<setting>,
+# includes too), AS_APPEND_AUP (CLN: always-use-proxy=true is missing), AS_FAIL (why the config
+# cannot be made Tor-only by the guard) and the eligibility result AS_ELIGIBLE/AS_NE_REASON.
+# Read-only.
 its_audit_scan() {
     local impl="$1" file="$2" i k line inc tor_active="" listen_lines=0 listen_ok=0 nat=0 iso=0 port
     local -a includes=()
-    AS_ACTION=() AS_KEYS=() AS_APPEND_AUP=0 AS_FAIL="" AS_ELIGIBLE=1 AS_NE_REASON="" AS_INC_FAIL=""
+    AS_ACTION=() AS_KEYS=() AS_HITS=() AS_APPEND_AUP=0 AS_FAIL="" AS_ELIGIBLE=1 AS_NE_REASON="" AS_INC_FAIL=""
     AS_HAVE_AUP=0 AS_HAVE_PROXY=0 AS_HAVE_TORBIND=0
     if ! its_read_lines "$file"; then
         AS_FAIL="config_unreadable"
@@ -392,6 +397,7 @@ its_audit_scan() {
             if its_lnd_hit; then
                 AS_ACTION[i]=delete
                 AS_KEYS+=("$P_KEY")
+                AS_HITS+=("${file}:$((i + 1)):${line}")
                 continue
             fi
             k="${P_KEY#tor.}"
@@ -410,6 +416,7 @@ its_audit_scan() {
             if its_cln_hit; then
                 AS_ACTION[i]="$P_ACTION"
                 AS_KEYS+=("$P_KEY")
+                AS_HITS+=("${file}:$((i + 1)):${line}")
                 [[ "$P_ACTION" == replace ]] && AS_HAVE_AUP=1
                 continue
             fi
@@ -435,11 +442,8 @@ its_audit_scan() {
     fi
     for inc in "${includes[@]}"; do
         its_cln_scan_includes "$inc" "${file%/*}"
-        if [[ -n "$AS_INC_FAIL" ]]; then
-            AS_FAIL="$AS_INC_FAIL"
-            break
-        fi
     done
+    [[ -z "$AS_INC_FAIL" ]] || AS_FAIL="$AS_INC_FAIL"
     if [[ "$AS_HAVE_AUP" -eq 0 ]]; then
         AS_APPEND_AUP=1
         AS_KEYS+=("always-use-proxy")
@@ -523,10 +527,11 @@ its_audit_repair() {
 # At-rest audit of config $2 (implementation $1, lnd|cl) toward Tor-only. $3 = check (read-only),
 # repair (fix clearnet settings, one backup) or plan (read-only; drift a repair would fix counts as
 # passable, used by --dry-run). $4 = unit base name (backup file name). Sets A_STATUS (clean, drift,
-# repaired or unrepairable), A_WHY, A_KEYS, A_REPAIRED, A_BACKUP, A_ELIGIBLE, A_NE_REASON, A_CONF.
+# repaired or unrepairable), A_WHY, A_KEYS, A_LINES (the clearnet lines still at rest, as
+# <file>:<line>:<setting>), A_REPAIRED, A_BACKUP, A_ELIGIBLE, A_NE_REASON, A_CONF.
 its_audit() {
     local impl="$1" file="$2" mode="$3" base="$4" resolved
-    A_STATUS="" A_WHY="" A_KEYS=() A_REPAIRED=() A_BACKUP="" A_ELIGIBLE=1 A_NE_REASON="" A_CONF=""
+    A_STATUS="" A_WHY="" A_KEYS=() A_LINES=() A_REPAIRED=() A_BACKUP="" A_ELIGIBLE=1 A_NE_REASON="" A_CONF=""
     resolved=$(readlink -f -- "$file" 2>/dev/null) || resolved=""
     if [[ -z "$resolved" ]] || [[ ! -e "$resolved" ]]; then
         A_STATUS="unrepairable"; A_WHY="config_missing"
@@ -535,6 +540,7 @@ its_audit() {
     A_CONF="$resolved"
     its_audit_scan "$impl" "$resolved"
     A_KEYS=("${AS_KEYS[@]}")
+    A_LINES=("${AS_HITS[@]}")
     A_ELIGIBLE="$AS_ELIGIBLE"
     A_NE_REASON="$AS_NE_REASON"
     if [[ -n "$AS_FAIL" ]]; then
@@ -555,6 +561,7 @@ its_audit() {
     fi
     A_REPAIRED=("${AS_KEYS[@]}")
     its_audit_scan "$impl" "$resolved"
+    A_LINES=("${AS_HITS[@]}")
     if [[ -n "$AS_FAIL" ]] || [[ ${#AS_KEYS[@]} -gt 0 ]]; then
         A_STATUS="unrepairable"; A_WHY="reaudit_failed"
         return 0
@@ -1091,7 +1098,7 @@ its_err() {   # $1 code, $2 class, $3 message
 }
 
 its_cmd_audit() {
-    local impl="${1:-}" repair=0 json=0 a rc state errors="[]" keys
+    local impl="${1:-}" repair=0 json=0 a rc state errors="[]" keys lines
     for a in "${@:2}"; do
         case "$a" in
             --repair) repair=1 ;;
@@ -1135,13 +1142,15 @@ its_cmd_audit() {
     else
         keys=$(printf '%s\n' "${A_KEYS[@]}" | jq -R 'select(. != "")' | jq -s -c .)
     fi
+    lines=$(printf '%s\n' "${A_LINES[@]}" | jq -R 'select(. != "")' | jq -s -c .)
     if [[ "$json" -eq 1 ]]; then
         its_doc audit "$rc" "$errors" '{impl: $impl, status: $status, reason: ($why | if . == "" then null else . end),
-            keys: $keys, eligible: ($eligible == "1"),
+            keys: $keys, lines: $lines, eligible: ($eligible == "1"),
             not_eligible_reason: ($ne | if . == "" then null else . end),
             backup: ($backup | if . == "" then null else . end), config: ($conf | if . == "" then null else . end)}' \
             --arg impl "$impl" --arg status "$A_STATUS" --arg why "$A_WHY" --argjson keys "$keys" \
-            --arg eligible "$A_ELIGIBLE" --arg ne "$A_NE_REASON" --arg backup "$A_BACKUP" --arg conf "$A_CONF"
+            --argjson lines "$lines" --arg eligible "$A_ELIGIBLE" --arg ne "$A_NE_REASON" --arg backup "$A_BACKUP" \
+            --arg conf "$A_CONF"
     else
         echo "status=${A_STATUS}${A_WHY:+ reason=${A_WHY}} keys=$(IFS=,; printf '%s' "${A_KEYS[*]:-none}") eligible=${A_ELIGIBLE}${A_NE_REASON:+ not_eligible_reason=${A_NE_REASON}}"
     fi

@@ -248,3 +248,25 @@ teardown() {
     [ "$status" -eq 1 ]
     [ "$(jq -r '.reason' <<< "$output")" = config_missing ]
 }
+
+@test "audit verb: lines names every clearnet line still at rest as file:line:setting, includes too" {
+    local lnd cln_inc
+    lnd_conf lnd-legacy-v3.conf
+    lnd=$(readlink -f "$LND")
+    run call its_cmd_audit lnd --json
+    [ "$status" -eq 4 ]
+    [ "$(jq -r '.lines | join("|")' <<< "$output")" = \
+        "${lnd}:8:externalhosts=de2.tunnelsats.com:24556|${lnd}:27:tor.skip-proxy-for-clearnet-targets=true" ]
+    echo inactive > "$FX/unit_state"
+    run call its_cmd_audit lnd --repair --json
+    [ "$status" -eq 0 ]
+    [ "$(jq -c '.lines' <<< "$output")" = "[]" ]
+    cln_conf cl-config
+    echo "include extra.conf" >> "$CLN"
+    printf '%s\n' 'log-prefix=x' 'announce-addr=203.0.113.5:9735' '  bind-addr=0.0.0.0:9735' > "$FX/app-data/.lightning/extra.conf"
+    cln_inc=$(readlink -f "$FX/app-data/.lightning/extra.conf")
+    run call its_cmd_audit cl --repair --json
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.reason, (.lines | join("|"))' <<< "$output" | tr '\n' ' ')" = \
+        "include_hybrid ${cln_inc}:2:announce-addr=203.0.113.5:9735|${cln_inc}:3:bind-addr=0.0.0.0:9735 " ]
+}

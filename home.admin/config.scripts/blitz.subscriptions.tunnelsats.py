@@ -77,6 +77,8 @@ API_CACHE_SECONDS = 6 * 3600
 
 IMPLS = ("lnd", "cl")
 UNITS = {"lnd": "lnd.service", "cl": "lightningd.service"}
+IMPL_OF_UNIT = {unit: impl for impl, unit in UNITS.items()}
+OTHER_IMPL = {"lnd": "cl", "cl": "lnd"}
 BASES = {"lnd": "lnd", "cl": "lightningd"}
 VARS = {"lnd": "TUNNELSATS_LND_ARGS", "cl": "TUNNELSATS_CLN_ARGS"}
 RESTARTABLE = ("emergency_block", "verify_timeout", "verify_unsafe", "verify_failed", "verify_invalid",
@@ -1470,6 +1472,44 @@ def purge(deps):
         pass
 
 
+def at_rest_audit(deps, impl, repair):
+    """The at-rest audit of implementation impl after the dataplane is gone: --repair (toward
+    Tor-only, one backup) if asked, read-only while the unit runs or if not asked. The document, or
+    None if the audit did not answer (timeout, error)."""
+    doc = None
+    if repair:
+        rc, doc = its(deps, ["audit", impl, "--repair", "--json"], timeout=60)
+    if not repair or (doc or {}).get("status") == "not_checked":
+        rc, doc = its(deps, ["audit", impl, "--json"], timeout=30)
+    return doc if isinstance(doc, dict) and isinstance(doc.get("status"), str) else None
+
+
+def at_rest_ok(doc, installed_only=False):
+    """Tor-only at rest per audit document doc; installed_only: a missing config counts as fine."""
+    if doc is None:
+        return False
+    if installed_only and doc.get("reason") == "config_missing":
+        return True
+    return doc.get("status") in ("clean", "repaired")
+
+
+def remove_action(impl, doc, unit, then):
+    """action_required of REMOVE for one implementation, in the form tunnelsats.sh uninstall uses:
+    the exact lines to remove (<file>:<line>:<setting>) and the command to run afterwards."""
+    lines = [line for line in (doc or {}).get("lines") or [] if isinstance(line, str)][:50]
+    if doc is None:
+        detail = "%s: the at-rest check did not answer; check the config of %s for TunnelSats clearnet " \
+                 "settings (LND: externalhosts, externalip, tor.skip-proxy-for-clearnet-targets; CLN: " \
+                 "bind-addr=0.0.0.0:9735, a clearnet addr or announce-addr, always-use-proxy=false)" % (impl, unit)
+    else:
+        keys = ",".join(k for k in doc.get("keys") or [] if isinstance(k, str)) or "none"
+        detail = "%s: %s (settings: %s)" % (impl, doc.get("reason") or doc.get("status"), keys)
+        if "always-use-proxy" in (doc.get("keys") or []):
+            detail += "; CLN needs always-use-proxy=true"
+    return {"reason": "node_config_clearnet" if lines else "node_config_unknown", "detail": detail,
+            "lines": lines, "then": then}
+
+
 def cmd_uninstall(deps, args, result):
     if not args.yes:
         raise ModuleError("E_CONFIRMATION_REQUIRED", "usage", "REMOVE needs --yes", EXIT_USAGE)
@@ -1510,21 +1550,55 @@ def cmd_uninstall(deps, args, result):
                                   "ln_was_active": bool(doc.get("ln_was_active")),
                                   "ln_started": bool(doc.get("ln_started")), "node_config": doc.get("node_config")})
             unit = doc.get("unit") if doc.get("unit") in UNITS.values() else unit
-        if impl:
-            rc, audit = its(deps, ["audit", impl, "--repair", "--json"], timeout=60)
-            result.fields["at_rest"] = (audit or {}).get("status")
-            other = "cl" if impl == "lnd" else "lnd"
-            rc, other_audit = its(deps, ["audit", other, "--json"], timeout=30)
-            result.fields["other_impl_at_rest"] = (other_audit or {}).get("status")
+        # uninstall --managed leaves the unit stopped and disabled when it cannot prove the node
+        # config clean (on RaspiBlitz always: ExecStart takes $TUNNELSATS_*_ARGS). Only this REMOVE's
+        # own audit of exactly that unit's implementation may undo it; the other one is checked too.
+        unit_impl = IMPL_OF_UNIT.get(unit) if unit else None
+        main_ok = other_ok = True
+        main_doc = other_doc = None
+        if unit_impl:
+            main_doc = at_rest_audit(deps, unit_impl, repair=True)
+            other_doc = at_rest_audit(deps, OTHER_IMPL[unit_impl], repair=False)
+            result.fields["at_rest"] = (main_doc or {}).get("status")
+            result.fields["other_impl_at_rest"] = (other_doc or {}).get("status")
+            main_ok = at_rest_ok(main_doc)
+            other_ok = at_rest_ok(other_doc, installed_only=True)
         complete = not result.fields["remaining"]
-        if complete and doc.get("ln_disabled") and unit:
+        if complete and main_ok and doc.get("ln_disabled") and unit:
             result.fields["ln_reenabled"] = systemctl(deps, "enable", unit)
-        if complete and doc.get("ln_was_active") and not doc.get("ln_started") and unit:
+        if complete and main_ok and doc.get("ln_was_active") and not doc.get("ln_started") and unit:
             result.fields["ln_started"] = systemctl(deps, "start", unit)
         if not complete:
             result.error("E_REMOVE_INCOMPLETE", "operational",
                          "removal incomplete: %s; Lightning stays stopped, run REMOVE again" %
                          ", ".join(result.fields["remaining"]), EXIT_OPERATIONAL)
+            return
+        if not (main_ok and other_ok):
+            actions, messages = [], []
+            if not main_ok:
+                then = None
+                if doc.get("ln_disabled"):
+                    then = "systemctl enable --now %s" % unit
+                    messages.append("%s stays stopped and disabled: its config is not Tor-only at rest" % unit)
+                elif doc.get("ln_was_active") and not doc.get("ln_started"):
+                    then = "systemctl start %s" % unit
+                    messages.append("%s stays stopped: its config is not Tor-only at rest" % unit)
+                else:
+                    messages.append("the config of %s is not Tor-only at rest" % unit)
+                actions.append(remove_action(unit_impl, main_doc, unit, then))
+            if not other_ok:
+                other_unit = UNITS[OTHER_IMPL[unit_impl]]
+                actions.append(remove_action(OTHER_IMPL[unit_impl], other_doc, other_unit, None))
+                messages.append("the config of %s is not Tor-only at rest" % other_unit)
+            then = next((a["then"] for a in actions if a["then"]), None)
+            result.fields["action_required"] = {
+                "reason": "node_config_clearnet" if any(a["lines"] for a in actions) else "node_config_unknown",
+                "detail": "; ".join(a["detail"] for a in actions),
+                "lines": [line for a in actions for line in a["lines"]],
+                "then": then}
+            result.error("E_AT_REST_UNREPAIRABLE", "operational",
+                         "%s. Remove the listed TunnelSats settings%s" % (
+                             "; ".join(messages), ", then run: sudo %s" % then if then else ""), EXIT_OPERATIONAL)
             return
         leftovers, warnings = zero_artifacts(deps, impl)
         result.fields["artifacts"] = leftovers
@@ -1839,8 +1913,14 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
 
 
 def result_text(doc):
+    action = doc.get("action_required") or {}
     if doc["errors"]:
-        return "%s\n\n%s" % (doc["errors"][0]["code"], doc["errors"][0]["message"])
+        lines = ["%s\n\n%s" % (doc["errors"][0]["code"], doc["errors"][0]["message"])]
+        if action.get("lines"):
+            lines += ["", "Lines to remove:"] + ["  %s" % line for line in action["lines"][:8]]
+        if action.get("then"):
+            lines += ["", "Then run: sudo %s" % action["then"]]
+        return "\n".join(lines)
     lines = ["Done."]
     if "verdict" in doc:
         lines.append("Connection check: %s" % VERDICT_TEXT.get(doc["verdict"], doc["verdict"]))
