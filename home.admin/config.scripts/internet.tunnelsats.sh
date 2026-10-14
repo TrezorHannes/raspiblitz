@@ -1753,13 +1753,23 @@ its_custom_file_ok() {
     return 0
 }
 
+# The block text; with $1 = 1 without the final newline (it then ends a file that had none).
+its_block_emit() {
+    if [[ "${1:-0}" -eq 1 ]]; then
+        printf '%s' "$(its_block_text)"
+    else
+        its_block_text
+    fi
+}
+
 # Scans file $1 for the markers (whole lines, a trailing CR ignored for the comparison). Sets
-# B_STATE (absent, present, malformed), B_BEGIN and B_END (line numbers) and B_MARKERS.
+# B_STATE (absent, present, malformed), B_BEGIN and B_END (line numbers), B_MARKERS and B_NLINES.
 its_block_scan() {
     local f="$1" i line nb=0 ne=0
     local -a lines=()
-    B_STATE="absent" B_BEGIN=0 B_END=0 B_MARKERS=()
+    B_STATE="absent" B_BEGIN=0 B_END=0 B_MARKERS=() B_NLINES=0
     mapfile -t lines < "$f" || return 1
+    B_NLINES=${#lines[@]}
     for i in "${!lines[@]}"; do
         line="${lines[i]%$'\r'}"
         if [[ "$line" == "$ITS_BLOCK_BEGIN" ]]; then
@@ -1776,6 +1786,12 @@ its_block_scan() {
         B_STATE="malformed"
     fi
     return 0
+}
+
+# Succeeds if the block scanned in file $1 is present and its END marker ends the file without a
+# newline (the file had no final newline before the block was added).
+its_block_at_eof_nonl() {
+    [[ "$B_STATE" == present ]] && [[ "$B_END" -eq "$B_NLINES" ]] && [[ -n "$(tail -c 1 -- "$1")" ]]
 }
 
 its_block_state_word() {
@@ -1847,7 +1863,7 @@ its_block_commit() {
 # block-insert [--check]: one marked, idempotent block directly after the shebang line (or at the
 # top); the rest of the file stays byte for byte. --check builds the result without writing.
 its_block_insert() {
-    local check="$1" src tmpl="${TS_RB_ROOT}/assets/custom-installs.sh" first="" tmp ref="" bak
+    local check="$1" src tmpl="${TS_RB_ROOT}/assets/custom-installs.sh" first="" tmp ref="" bak nonl=0
     B_CREATED="false" B_BACKUP=""
     if [[ ! -e "$TS_RB_CUSTOM" ]] && [[ ! -L "$TS_RB_CUSTOM" ]]; then
         if ! its_custom_file_ok "$tmpl"; then
@@ -1866,7 +1882,10 @@ its_block_insert() {
         B_CODE="E_BLOCK_MALFORMED"; B_MSG="unmatched TunnelSats markers at lines $(IFS=,; printf '%s' "${B_MARKERS[*]}"): fix them by hand"
         return 1
     fi
-    if [[ "$B_STATE" == present ]] && cmp -s <(sed -n "${B_BEGIN},${B_END}p" "$src") <(its_block_text); then
+    # a block that ends the file without a newline keeps doing so (the file had no final newline)
+    nonl=0
+    its_block_at_eof_nonl "$src" && nonl=1
+    if [[ "$B_STATE" == present ]] && cmp -s <(sed -n "${B_BEGIN},${B_END}p" "$src") <(its_block_emit "$nonl"); then
         B_CHANGED="false"
         return 0
     fi
@@ -1877,10 +1896,13 @@ its_block_insert() {
     tmp=$(mktemp "${TS_RB_CUSTOM%/*}/.custom-installs.sh.tunnelsats.XXXXXX" 2>/dev/null) || {
         B_CODE="E_WRITE_FAILED"; B_MSG="no temp file next to ${TS_RB_CUSTOM}"; return 1; }
     if [[ "$B_STATE" == present ]]; then
-        { head -n "$((B_BEGIN - 1))" -- "$src"; its_block_text; tail -n "+$((B_END + 1))" -- "$src"; } > "$tmp"
+        { head -n "$((B_BEGIN - 1))" -- "$src"; its_block_emit "$nonl"; tail -n "+$((B_END + 1))" -- "$src"; } > "$tmp"
     else
         IFS= read -r first < "$src" || true
-        if [[ "$first" == '#!'* ]]; then
+        if [[ "$first" == '#!'* ]] && [[ "$(wc -l < "$src")" -eq 0 ]]; then
+            # only a shebang line without a newline: the block takes over the missing final newline
+            { printf '%s\n' "$first"; its_block_emit 1; } > "$tmp"
+        elif [[ "$first" == '#!'* ]]; then
             { printf '%s\n' "$first"; its_block_text; tail -n +2 -- "$src"; } > "$tmp"
         else
             { its_block_text; cat -- "$src"; } > "$tmp"
@@ -1921,9 +1943,11 @@ its_block_insert() {
     return 0
 }
 
-# block-remove: drops the BEGIN line, the END line and the lines between them, nothing else.
+# block-remove: drops the BEGIN line, the END line and the lines between them, nothing else. If the
+# block ended the file without a newline, the file had none before it: the line before the block
+# gets its missing final newline back.
 its_block_remove() {
-    local tmp was_ok=0
+    local tmp was_ok=0 nonl=0
     B_CREATED="false" B_BACKUP=""
     if [[ ! -e "$TS_RB_CUSTOM" ]] && [[ ! -L "$TS_RB_CUSTOM" ]]; then
         B_STATE="absent" B_CHANGED="false"
@@ -1938,10 +1962,14 @@ its_block_remove() {
             return 1
             ;;
     esac
+    its_block_at_eof_nonl "$TS_RB_CUSTOM" && nonl=1
     bash -n "$TS_RB_CUSTOM" 2>/dev/null && was_ok=1
     tmp=$(mktemp "${TS_RB_CUSTOM%/*}/.custom-installs.sh.tunnelsats.XXXXXX" 2>/dev/null) || {
         B_CODE="E_WRITE_FAILED"; B_MSG="no temp file next to ${TS_RB_CUSTOM}"; return 1; }
     { head -n "$((B_BEGIN - 1))" -- "$TS_RB_CUSTOM"; tail -n "+$((B_END + 1))" -- "$TS_RB_CUSTOM"; } > "$tmp"
+    if [[ "$nonl" -eq 1 ]] && [[ -s "$tmp" ]] && [[ -z "$(tail -c 1 -- "$tmp")" ]]; then
+        truncate -s -1 -- "$tmp"
+    fi
     if [[ "$was_ok" -eq 1 ]] && ! bash -n "$tmp" 2>/dev/null; then
         rm -f -- "$tmp"
         B_CODE="E_BLOCK_SYNTAX"; B_MSG="the result would not pass bash -n; nothing was changed"

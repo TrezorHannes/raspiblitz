@@ -113,6 +113,31 @@ no_temp_files() {
     cmp "$FX/expected" "$TS_RB_CUSTOM"
 }
 
+@test "a shebang-only file without a final newline: insert, insert again, update and remove keep its bytes" {
+    local shebang
+    for shebang in '#!/bin/bash' $'#!/bin/bash\r'; do
+        printf '%s' "$shebang" > "$TS_RB_CUSTOM"
+        cp "$TS_RB_CUSTOM" "$FX/original"
+        block_json block-insert
+        [ "$status" -eq 0 ]
+        { printf '%s\n' "$shebang"; printf '%s' "$(cat "$BLOCK")"; } > "$FX/expected"
+        cmp "$FX/expected" "$TS_RB_CUSTOM"
+        block_json block-insert
+        [ "$(jq -r .changed <<< "$output")" = false ]
+        cmp "$FX/expected" "$TS_RB_CUSTOM"
+        # an older block version at the end of the file is replaced the same way
+        { printf '%s\n' "$shebang"; head -n 1 "$BLOCK"; echo 'echo old block body'; printf '%s' "$(tail -n 1 "$BLOCK")"; } > "$TS_RB_CUSTOM"
+        block_json block-insert
+        [ "$(jq -r .changed <<< "$output")" = true ]
+        cmp "$FX/expected" "$TS_RB_CUSTOM"
+        block_json block-remove
+        [ "$status" -eq 0 ]
+        cmp "$FX/original" "$TS_RB_CUSTOM"
+        rm -f "$FX/app-data/tunnelsats/backup/custom-installs.sh.pre-tunnelsats"
+    done
+    no_temp_files
+}
+
 @test "a user exit 0 and a set -e script keep the block first, and the block runs" {
     printf '#!/bin/bash\nexit 0\necho never\n' > "$TS_RB_CUSTOM"
     block_json block-insert
