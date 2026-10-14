@@ -28,6 +28,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import ssl
 import subprocess
 import sys
@@ -75,6 +76,19 @@ API_READ_TIMEOUT = 30
 API_MAX_BYTES = 65536
 API_CACHE_SECONDS = 6 * 3600
 
+# Timeouts (s) for internet.tunnelsats.sh, each above the script's own worst case, so the script
+# ends by itself and cleans up; run_command stops the whole process group only as a last resort.
+ITS_TIMEOUT = {
+    "fetch": 300,            # its_fetch_online: TS_RB_FETCH_BUDGET (240) for all network steps
+    "detect": 420,           # a fetch when no copy is stored, then the tool's detect (120, +10 kill)
+    "install": 960,          # the tool's install --managed (900, +10 kill)
+    "uninstall": 660,        # the tool's uninstall --managed (600, +10 kill)
+    "verify": 150,           # the tool's verify with probes (120, +10 kill)
+    "verify_no_probe": 60,   # the tool's verify --no-probe (35, +10 kill)
+    "status": 60,            # one verify --no-probe (TS_RB_VERIFY_TIMEOUT 30, +5 kill)
+    "guard_dry_run": 120,    # one verify (30, +5 kill), no handshake wait in --dry-run
+}
+
 IMPLS = ("lnd", "cl")
 UNITS = {"lnd": "lnd.service", "cl": "lightningd.service"}
 IMPL_OF_UNIT = {unit: impl for impl, unit in UNITS.items()}
@@ -117,19 +131,42 @@ class ModuleError(Exception):
 # Effects (injectable)
 # ------------------------------------------------------------------------------------------
 
+def stop_group(proc, grace=10):
+    """Stops the process group of proc (started with start_new_session): SIGTERM, so the scripts'
+    EXIT and TERM traps can remove their temp files, SIGKILL after grace seconds. Reaps proc."""
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.communicate(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    proc.kill()
+    proc.communicate()
+
+
 def run_command(argv, timeout=60, interactive=False):
-    """Runs argv (a list, never through a shell). Returns (rc, stdout, stderr)."""
+    """Runs argv (a list, never through a shell). Returns (rc, stdout, stderr); a timeout is rc 124.
+    The command runs in its own process group, so a timeout stops it with all its children."""
     if interactive:
         return subprocess.run(argv, timeout=timeout, check=False).returncode, "", ""
     try:
-        proc = subprocess.run(argv, timeout=timeout, check=False, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.TimeoutExpired:
-        return 124, "", "timeout"
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
     except OSError as exc:
         return 127, "", str(exc)
-    return (proc.returncode, proc.stdout.decode("utf-8", "replace"),
-            proc.stderr.decode("utf-8", "replace"))
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        stop_group(proc)
+        return 124, "", "timeout"
+    except BaseException:
+        stop_group(proc)
+        raise
+    return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 
 
 def http_post_json(url, payload):
@@ -783,7 +820,7 @@ def detect(deps, requested=None):
             reasons.append("config_unrepairable:%s" % audit.get("reason"))
         elif audit.get("eligible") is False:
             reasons.append("not_eligible:%s" % audit.get("not_eligible_reason"))
-    rc, tool = its(deps, ["detect", "--json"], timeout=300)
+    rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
     kind = None
     artifacts = []
     capabilities = {}
@@ -893,7 +930,7 @@ def activate(deps, impl, result, stored_writer=None):
     activation = {"fetch": None, "unit_regenerated": False, "install": None, "ln_restarted": None,
                   "restore_block": None, "tick_timer": None}
     result.fields["activation"] = activation
-    rc, doc = its(deps, ["fetch", "--json"], timeout=300)
+    rc, doc = its(deps, ["fetch", "--json"], timeout=ITS_TIMEOUT["fetch"])
     activation["fetch"] = "ok" if rc == 0 else tool_error(doc, "E_DOWNLOAD_FAILED")
     if rc != 0:
         raise ModuleError(activation["fetch"], "operational",
@@ -910,7 +947,7 @@ def activate(deps, impl, result, stored_writer=None):
         activation["unit_regenerated"] = True
     blitz_conf_set(deps, "tunnelsatsImpl", impl)
     blitz_conf_set(deps, "tunnelsats", "on")
-    rc, doc = its(deps, ["install", "--impl", impl, "--json"], timeout=960)
+    rc, doc = its(deps, ["install", "--impl", impl, "--json"], timeout=ITS_TIMEOUT["install"])
     if rc != 0:
         blitz_conf_set(deps, "tunnelsats", "off")
         activation["install"] = tool_error(doc, "E_INSTALL_FAILED")
@@ -930,7 +967,7 @@ def wait_for_handshake(deps, seconds=60, step=5):
     """Waits up to 60 s for the first handshake of the tunnel (verify --no-probe)."""
     waited = 0
     while True:
-        rc, doc = its(deps, ["verify", "--no-probe", "--json"], timeout=45)
+        rc, doc = its(deps, ["verify", "--no-probe", "--json"], timeout=ITS_TIMEOUT["verify_no_probe"])
         checks = (doc or {}).get("checks") or []
         if any(isinstance(c, dict) and c.get("id") == "wg_handshake" and c.get("result") == "pass" for c in checks):
             return True
@@ -1078,7 +1115,7 @@ def cmd_adopt(deps, args, result):
     if args.upgrade:
         raise ModuleError("E_UPGRADE_UNAVAILABLE", "refused",
                           "UPGRADE to managed mode comes with a later TunnelSats release", EXIT_REFUSED)
-    rc, tool = its(deps, ["detect", "--json"], timeout=300)
+    rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
     if tool is None or rc != 0:
         raise ModuleError("E_DETECT_FAILED", "operational", "the TunnelSats install could not be detected",
                           EXIT_OPERATIONAL)
@@ -1296,7 +1333,7 @@ def run_check(deps):
         checks.append({"id": cid, "class": cls, "result": res, "detail": detail})
 
     if not state:
-        rc, verify = its(deps, ["verify", "--no-probe", "--json"], timeout=45)
+        rc, verify = its(deps, ["verify", "--no-probe", "--json"], timeout=ITS_TIMEOUT["verify_no_probe"])
         if rc == 9:
             add("legacy_lifecycle", "unsafe", "fail", "legacy setup: the kill switch depends on the tunnel being up "
                 "(ADOPT takes over the subscription)")
@@ -1315,7 +1352,7 @@ def run_check(deps):
                 "guard": {}, "restart_needed": False}
     impl = state.get("impl") or conf.get("tunnelsatsImpl")
     unit, base = UNITS.get(impl, "lnd.service"), BASES.get(impl, "lnd")
-    rc, verify = its(deps, ["verify", "--json"], timeout=150)
+    rc, verify = its(deps, ["verify", "--json"], timeout=ITS_TIMEOUT["verify"])
     clearnet_blocked = None
     if verify is None:
         add("verify", "unsafe", "fail", "tunnelsats verify did not answer")
@@ -1354,7 +1391,7 @@ def run_check(deps):
     restart_needed = False
     if record and props["ActiveState"] == "active" and record.get("invocation_id") == props["InvocationID"] and \
             record.get("reason") in RESTARTABLE and decision in ("tor-only", "hybrid"):
-        rc, dry = its(deps, ["guard", impl, "mainnet", "--dry-run", "--json"], timeout=120)
+        rc, dry = its(deps, ["guard", impl, "mainnet", "--dry-run", "--json"], timeout=ITS_TIMEOUT["guard_dry_run"])
         if dry and dry.get("decision") == "hybrid" and (impl == "lnd" or dry.get("reason") == "ok"):
             restart_needed = True
     if restart_needed:
@@ -1389,7 +1426,7 @@ def run_check(deps):
         add("restore_block", "degraded", "pass", "restore block present in custom-installs.sh")
     else:
         add("restore_block", "degraded", "fail", "TunnelSats is not restored automatically after an SD-card update")
-    rc, its_state = its(deps, ["status", "--json"], timeout=60)
+    rc, its_state = its(deps, ["status", "--json"], timeout=ITS_TIMEOUT["status"])
     tool_hash = (its_state or {}).get("tool_hash")
     if tool_hash == "current":
         add("tool_pin", "degraded", "pass", "tunnelsats.sh is the pinned version")
@@ -1457,7 +1494,7 @@ def zero_artifacts(deps, impl, conf_flag_off_expected=True):
     """What is left after REMOVE (design 6.6 step 10)."""
     leftovers = []
     warnings = []
-    rc, tool = its(deps, ["detect", "--json"], timeout=300)
+    rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
     kind = ((tool or {}).get("install") or {}).get("kind")
     if kind != "none":
         leftovers.append("tunnelsats install (%s)" % kind)
@@ -1554,7 +1591,7 @@ def cmd_uninstall(deps, args, result):
             purge(deps)
         result.fields.update({"removed": True, "purged": True, "forgotten": True})
         return
-    rc, tool = its(deps, ["detect", "--json"], timeout=300)
+    rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
     managed = ((tool or {}).get("install") or {}).get("kind") == "managed"
     if not state and conf.get("tunnelsats") != "on" and not managed:
         raise ModuleError("E_NOT_CONFIGURED", "not_configured", "TunnelSats is not set up on this node",
@@ -1575,7 +1612,7 @@ def cmd_uninstall(deps, args, result):
         unit = UNITS.get(impl)
         doc = {}
         if managed:
-            rc, doc = its(deps, ["uninstall", "--json"], timeout=660)
+            rc, doc = its(deps, ["uninstall", "--json"], timeout=ITS_TIMEOUT["uninstall"])
             doc = doc or {}
             result.fields.update({"remaining": doc.get("remaining") or ([] if rc == 0 else ["managed dataplane"]),
                                   "ln_was_active": bool(doc.get("ln_was_active")),
@@ -1648,7 +1685,7 @@ def cmd_uninstall(deps, args, result):
 # ------------------------------------------------------------------------------------------
 
 def dataplane_healthy(deps, impl):
-    rc, doc = its(deps, ["verify", "--no-probe", "--json"], timeout=45)
+    rc, doc = its(deps, ["verify", "--no-probe", "--json"], timeout=ITS_TIMEOUT["verify_no_probe"])
     if rc not in (0, 5) or not doc:
         return False
     if doc.get("install_state") != "installed" or doc.get("unit") != UNITS[impl] or doc.get("emergency_block"):
@@ -1685,14 +1722,14 @@ def cmd_repair(deps, args, result):
     actions = []
     result.fields["actions"] = actions
     with Lock(deps, wait=30):
-        rc, tool = its(deps, ["detect", "--json"], timeout=300)
+        rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
         managed = ((tool or {}).get("install") or {}).get("kind") == "managed"
-        rc, its_state = its(deps, ["status", "--json"], timeout=60)
+        rc, its_state = its(deps, ["status", "--json"], timeout=ITS_TIMEOUT["status"])
         current_tool = (its_state or {}).get("tool_hash") == "current"
         unit = UNITS[impl]
         was_active = unit_props(deps, unit, "ActiveState")["ActiveState"] == "active"
         if managed and (not current_tool or state.get("impl") != impl or not dataplane_healthy(deps, impl)):
-            rc, doc = its(deps, ["uninstall", "--json"], timeout=660)
+            rc, doc = its(deps, ["uninstall", "--json"], timeout=ITS_TIMEOUT["uninstall"])
             actions.append("uninstall")
             doc = doc or {}
             if rc != 0 or doc.get("remaining"):
@@ -1711,7 +1748,7 @@ def cmd_repair(deps, args, result):
                 systemctl(deps, "start", unit)
                 actions.append("start")
         else:
-            rc, out, _err = deps.run([ITS, "fetch", "--json"], timeout=300)
+            rc, out, _err = deps.run([ITS, "fetch", "--json"], timeout=ITS_TIMEOUT["fetch"])
             if not unit_template_ok(deps, impl):
                 regenerate_unit(deps, impl)
                 actions.append("unit_regenerated")
@@ -1802,7 +1839,7 @@ def cmd_tick(deps, args, result):
             return
         if record.get("decision") not in ("tor-only", "hybrid") or record.get("reason") not in RESTARTABLE:
             return
-        rc, dry = its(deps, ["guard", impl, "mainnet", "--dry-run", "--json"], timeout=120)
+        rc, dry = its(deps, ["guard", impl, "mainnet", "--dry-run", "--json"], timeout=ITS_TIMEOUT["guard_dry_run"])
         if not dry or dry.get("decision") != "hybrid" or (impl == "cl" and dry.get("reason") != "ok"):
             return
         result.fields["restart_needed"] = True

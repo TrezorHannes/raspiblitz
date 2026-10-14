@@ -60,6 +60,8 @@ its_init_paths() {
     TS_RB_HANDSHAKE_POLL="${TS_RB_HANDSHAKE_POLL:-2}"
     TS_RB_UNIT_DIR="${TS_RB_UNIT_DIR:-/etc/systemd/system}"
     TS_RB_LOGGER="${TS_RB_LOGGER:-logger}"
+    # seconds for all network steps of one online fetch together (git and the signature check)
+    TS_RB_FETCH_BUDGET="${TS_RB_FETCH_BUDGET:-240}"
 }
 its_init_paths
 
@@ -1373,19 +1375,33 @@ its_fetch_offline() {
     return 0
 }
 
-# git for the download: clean environment (no user or system config, no prompts), time limit.
+# Seconds left of the fetch budget (F_DEADLINE), at most 120 per step. Fails when none is left.
+its_fetch_left() {
+    local left
+    its_now
+    left=$(( (F_DEADLINE - NOW_MS) / 1000 ))
+    (( left >= 1 )) || return 1
+    (( left <= 120 )) || left=120
+    printf '%s' "$left"
+}
+
+# git for the download: clean environment (no user or system config, no prompts), the time left.
 its_git() {
+    local t
+    t=$(its_fetch_left) || return 124
     env -i PATH="$ITS_SAFE_PATH" HOME="$F_HOME" LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 \
-        timeout 120 git "$@" </dev/null >/dev/null 2>&1
+        timeout --kill-after=5 "$t" git "$@" </dev/null >/dev/null 2>&1
 }
 
 # Downloads exactly the pinned commit (shallow, sparse, one blob), then checks the commit id, the
 # web-flow signature (blitz.git-verify.sh, commit mode), the sha256 and the VERSION and TS_CONTRACT
 # lines, and stores the copy atomically (root 0644 in the root 0700 state directory). Never a
-# branch, never an unpinned file.
+# branch, never an unpinned file. All network steps share TS_RB_FETCH_BUDGET seconds.
 its_fetch_online() {
-    local d repo head sha f old
+    local d repo head sha f old t rc
     its_fetch_reset network
+    its_now
+    F_DEADLINE=$(( NOW_MS + TS_RB_FETCH_BUDGET * 1000 ))
     if ! its_run_dir_ok || ! its_state_subdir dist || ! d=$(mktemp -d "${TS_RB_RUN_DIR}/.fetch.XXXXXX" 2>/dev/null); then
         its_fetch_fail E_DOWNLOAD_FAILED operational "the run or state directory cannot be used"
         return 1
@@ -1400,7 +1416,11 @@ its_fetch_online() {
         ! its_git -C "$repo" sparse-checkout set --no-cone /scripts/tunnelsats.sh || \
         ! its_git -C "$repo" fetch -q --depth 1 --filter=blob:none origin "$TS_PIN_COMMIT" || \
         ! its_git -C "$repo" checkout -q --detach FETCH_HEAD; then
-        its_fetch_fail E_DOWNLOAD_FAILED operational "downloading commit ${TS_PIN_COMMIT:0:12} failed"
+        if its_fetch_left >/dev/null; then
+            its_fetch_fail E_DOWNLOAD_FAILED operational "downloading commit ${TS_PIN_COMMIT:0:12} failed"
+        else
+            its_fetch_fail E_DOWNLOAD_FAILED operational "downloading commit ${TS_PIN_COMMIT:0:12} did not finish within ${TS_RB_FETCH_BUDGET} s"
+        fi
         return 1
     fi
     head=$(env -i PATH="$ITS_SAFE_PATH" HOME="$F_HOME" LC_ALL=C GIT_CONFIG_NOSYSTEM=1 git -C "$repo" rev-parse HEAD 2>/dev/null) || head=""
@@ -1408,7 +1428,17 @@ its_fetch_online() {
         its_fetch_fail E_PIN_MISMATCH integrity "the downloaded commit is not the pinned one"
         return 1
     fi
-    if ! (cd "$repo" && "${TS_RB_ROOT}/config.scripts/blitz.git-verify.sh" "$TS_PIN_SIGNER" "$TS_PIN_KEY_URL" "$TS_PIN_KEY_FPR") >&2 </dev/null; then
+    if ! t=$(its_fetch_left); then
+        its_fetch_fail E_DOWNLOAD_FAILED operational "the download did not finish within ${TS_RB_FETCH_BUDGET} s"
+        return 1
+    fi
+    (cd "$repo" && timeout --kill-after=5 "$t" "${TS_RB_ROOT}/config.scripts/blitz.git-verify.sh" "$TS_PIN_SIGNER" \
+        "$TS_PIN_KEY_URL" "$TS_PIN_KEY_FPR") >&2 </dev/null
+    rc=$?
+    if [[ "$rc" -eq 124 ]] || [[ "$rc" -eq 137 ]]; then
+        its_fetch_fail E_DOWNLOAD_FAILED operational "the signature check did not finish within ${TS_RB_FETCH_BUDGET} s"
+        return 1
+    elif [[ "$rc" -ne 0 ]]; then
         F_SIG="bad"
         its_fetch_fail E_SIGNATURE integrity "the signature of the pinned commit could not be verified (signer ${TS_PIN_SIGNER}, key ${TS_PIN_KEY_FPR})"
         return 1

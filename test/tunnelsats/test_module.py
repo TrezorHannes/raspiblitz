@@ -14,10 +14,12 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -58,6 +60,7 @@ class FakeSystem:
     def __init__(self, root):
         self.root = root
         self.calls = []
+        self.timeouts = []
         self.http_calls = []
         self.http_responses = []
         self.sleeps = []
@@ -106,6 +109,7 @@ class FakeSystem:
 
     def run(self, argv, timeout=60, interactive=False):
         self.calls.append(list(argv))
+        self.timeouts.append((list(argv), timeout))
         prog = argv[0]
         if prog == mod.BLITZ_CONF and argv[1] == "set":
             self.conf_set(argv[2], argv[3])
@@ -538,6 +542,9 @@ class TestImport(ModuleTestCase):
         self.assertEqual(("managed", "lnd", ALICE_PUB, 24556), (state["mode"], state["impl"], state["public_key"],
                                                                 state["vpn_port"]))
         self.assertNotIn(ALICE_PRIV, json.dumps(state))
+        timeouts = {argv[1]: t for argv, t in f.timeouts if argv[0] == mod.ITS}
+        self.assertEqual([mod.ITS_TIMEOUT[verb] for verb in ("fetch", "detect", "install")],
+                         [timeouts[verb] for verb in ("fetch", "detect", "install")])
 
     def test_guard_less_unit_is_regenerated_before_the_flag(self):
         self.write("etc/systemd/system/lnd.service", "[Service]\nExecStart=/usr/local/bin/lnd\n")
@@ -611,6 +618,63 @@ class TestImport(ModuleTestCase):
 # ------------------------------------------------------------------------------------------
 # REMOVE, ADOPT, REPAIR
 # ------------------------------------------------------------------------------------------
+
+class TestRunCommand(unittest.TestCase):
+    """The production run_command on real processes (no network)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ts-run-")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_timeout_stops_the_whole_process_group_and_lets_traps_clean_up(self):
+        script = os.path.join(self.dir, "slow.sh")
+        with open(script, "w") as handle:
+            handle.write('#!/bin/bash\ntrap \'echo cleaned > "$1/trap"; exit 143\' TERM\n'
+                         'sleep 30 &\necho $! > "$1/child"\nwait\n')
+        started = time.monotonic()
+        self.assertEqual((124, "", "timeout"), mod.run_command(["bash", script, self.dir], timeout=1))
+        self.assertLess(time.monotonic() - started, 10)
+        with open(os.path.join(self.dir, "trap")) as handle:
+            self.assertEqual("cleaned\n", handle.read())
+        with open(os.path.join(self.dir, "child")) as handle:
+            child = int(handle.read())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("the child of the timed-out command still runs")
+
+    def test_output_exit_code_and_a_missing_program(self):
+        self.assertEqual((3, "out\n", "err\n"), mod.run_command(["sh", "-c", "echo out; echo err >&2; exit 3"]))
+        self.assertEqual(127, mod.run_command([os.path.join(self.dir, "missing")])[0])
+
+    def test_timeouts_cover_the_script_worst_cases(self):
+        with open(ITS_PATH) as handle:
+            text = handle.read()
+        budget = int(re.search(r'TS_RB_FETCH_BUDGET="\$\{TS_RB_FETCH_BUDGET:-([0-9]+)\}"', text).group(1))
+        verify_timeout = int(re.search(r'TS_RB_VERIFY_TIMEOUT="\$\{TS_RB_VERIFY_TIMEOUT:-([0-9]+)\}"', text).group(1))
+
+        def tool(verb):   # timeout and kill-after of the pinned tool's verb in the script
+            m = re.search(r'its_tool_out "\$json" %s "[^"]+" "[^"]+" "?([0-9]+|\$t)"? %s' % (verb, verb), text)
+            return int(m.group(1)) if m and m.group(1).isdigit() else None
+
+        t = mod.ITS_TIMEOUT
+        self.assertGreater(t["fetch"], budget + 10)
+        self.assertGreater(t["detect"], budget + 10 + tool("detect") + 10)
+        self.assertGreater(t["install"], tool("install") + 10)
+        self.assertGreater(t["uninstall"], tool("uninstall") + 10)
+        self.assertGreater(t["verify"], 120 + 10)
+        self.assertGreater(t["verify_no_probe"], 35 + 10)
+        self.assertGreater(t["status"], verify_timeout + 5)
+        self.assertGreater(t["guard_dry_run"], verify_timeout + 5)
+        self.assertIn('timeout --kill-after=5 "$t" git', text)
+        self.assertNotIn("timeout 120 git", text)
+
 
 class TestTemplates(unittest.TestCase):
     def test_guard_line_is_the_line_the_unit_templates_write(self):

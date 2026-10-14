@@ -131,6 +131,32 @@ upstream_repo() {   # $1 = TS_CONTRACT value in the file (default 1)
     [ "$(jq -r .error <<< "$output")" = E_DOWNLOAD_FAILED ]
 }
 
+@test "fetch online: all network steps share one time budget (a remote that never answers)" {
+    local pid port
+    upstream_repo
+    # a git:// server that accepts connections and never answers
+    python3 -c 'import socket, sys
+s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(8)
+open(sys.argv[1], "w").write(str(s.getsockname()[1]))
+conns = []
+while True:
+    conns.append(s.accept()[0])' "$FX/port" 3>&- &
+    pid=$!
+    for _ in $(seq 50); do [ -s "$FX/port" ] && break; sleep 0.1; done
+    port=$(cat "$FX/port")
+    TS_REPO_URL="git://127.0.0.1:${port}/tunnelsats.git"
+    TS_RB_FETCH_BUDGET=3
+    SECONDS=0
+    run --separate-stderr call its_cmd_fetch --json
+    kill "$pid"
+    [ "$status" -eq 1 ]
+    [ "$SECONDS" -lt 15 ]
+    [ "$(jq -r .error <<< "$output")" = E_DOWNLOAD_FAILED ]
+    [[ "$(jq -r '.errors[0].message' <<< "$output")" == *"did not finish within 3 s"* ]]
+    [ ! -e "$DIST" ]
+    [ -z "$(find "$TS_RB_RUN_DIR" -mindepth 1 -name '.fetch.*')" ]
+}
+
 @test "fetch --offline: no copy (exit 3), a copy with another hash is deleted (exit 1), a matching copy is used" {
     run --separate-stderr call its_cmd_fetch --offline --json
     [ "$status" -eq 3 ]
