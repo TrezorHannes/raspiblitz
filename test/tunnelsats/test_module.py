@@ -889,6 +889,24 @@ class TestRepair(ModuleTestCase):
         self.assertEqual(["uninstall", "reenable", "install"], doc["actions"][:3])
         self.assertLess(self.fake.calls.index([mod.ITS, "uninstall", "--json"]),
                         self.fake.index_of(mod.ITS, "install"))
+        self.assertLess(self.fake.calls.index([mod.ITS, "audit", "lnd", "--repair", "--json"]),
+                        self.fake.calls.index(["systemctl", "enable", "lnd.service"]))
+
+    def test_a_unit_disabled_by_uninstall_is_enabled_only_after_a_tor_only_audit(self):
+        self.store()
+        self.activate_conf()
+        self.fake.its["detect"] = (0, fixture_json("tool", "detect_managed.json"))
+        self.fake.its["status"] = (0, {"tool_hash": "accepted_older"})
+        line = "/mnt/hdd/app-data/lnd/lnd.conf:8:externalhosts=de2.tunnelsats.com:24556"
+        self.fake.its["audit lnd --repair"] = (1, {"status": "unrepairable", "reason": "backup_failed",
+                                                   "keys": ["externalhosts"], "lines": [line]})
+        doc = self.run_verb("repair", "--yes")
+        self.assertEqual((1, "E_AT_REST_UNREPAIRABLE"), (doc["exit_code"], doc["errors"][0]["code"]))
+        self.assertEqual(([line], "systemctl enable --now lnd.service"),
+                         (doc["action_required"]["lines"], doc["action_required"]["then"]))
+        self.assertEqual(["uninstall"], doc["actions"])
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable"))
+        self.assertEqual(-1, self.fake.index_of(mod.ITS, "install"))
 
     def test_healthy_install_only_reapplies_block_and_timer(self):
         self.store()

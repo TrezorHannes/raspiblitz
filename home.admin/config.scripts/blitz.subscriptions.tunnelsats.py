@@ -1561,8 +1561,8 @@ def at_rest_ok(doc, installed_only=False):
     return doc.get("status") in ("clean", "repaired")
 
 
-def remove_action(impl, doc, unit, then):
-    """action_required of REMOVE for one implementation, in the form tunnelsats.sh uninstall uses:
+def at_rest_action(impl, doc, unit, then):
+    """action_required of REMOVE and REPAIR for one implementation, in the form tunnelsats.sh uninstall uses:
     the exact lines to remove (<file>:<line>:<setting>) and the command to run afterwards."""
     lines = [line for line in (doc or {}).get("lines") or [] if isinstance(line, str)][:50]
     if doc is None:
@@ -1653,10 +1653,10 @@ def cmd_uninstall(deps, args, result):
                     messages.append("%s stays stopped: its config is not Tor-only at rest" % unit)
                 else:
                     messages.append("the config of %s is not Tor-only at rest" % unit)
-                actions.append(remove_action(unit_impl, main_doc, unit, then))
+                actions.append(at_rest_action(unit_impl, main_doc, unit, then))
             if not other_ok:
                 other_unit = UNITS[OTHER_IMPL[unit_impl]]
-                actions.append(remove_action(OTHER_IMPL[unit_impl], other_doc, other_unit, None))
+                actions.append(at_rest_action(OTHER_IMPL[unit_impl], other_doc, other_unit, None))
                 messages.append("the config of %s is not Tor-only at rest" % other_unit)
             then = next((a["then"] for a in actions if a["then"]), None)
             result.fields["action_required"] = {
@@ -1736,6 +1736,16 @@ def cmd_repair(deps, args, result):
                 raise ModuleError("E_REMOVE_INCOMPLETE", "operational",
                                   "the old dataplane could not be removed; Lightning stays stopped", EXIT_OPERATIONAL)
             if doc.get("ln_disabled") and doc.get("unit") in UNITS.values():
+                # as in REMOVE: undo uninstall's disable only after a Tor-only at-rest audit of that
+                # unit (if the activation below fails, TunnelSats is off and the guard repairs nothing)
+                audit = at_rest_audit(deps, IMPL_OF_UNIT[doc["unit"]], repair=True)
+                if not at_rest_ok(audit):
+                    then = "systemctl enable --now %s" % doc["unit"]
+                    result.fields["action_required"] = at_rest_action(IMPL_OF_UNIT[doc["unit"]], audit, doc["unit"], then)
+                    raise ModuleError("E_AT_REST_UNREPAIRABLE", "operational",
+                                      "%s stays stopped and disabled: its config is not Tor-only at rest. Remove the "
+                                      "listed TunnelSats settings, then run: sudo %s, and REPAIR again"
+                                      % (doc["unit"], then), EXIT_OPERATIONAL)
                 systemctl(deps, "enable", doc["unit"])
                 actions.append("reenable")
             was_active = was_active or bool(doc.get("ln_was_active"))
