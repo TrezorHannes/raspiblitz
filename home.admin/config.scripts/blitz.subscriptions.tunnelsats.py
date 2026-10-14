@@ -1659,6 +1659,11 @@ def cmd_repair(deps, args, result):
         raise ModuleError("E_STORED_CONFIG", "operational", "the stored config is missing or invalid: IMPORT again",
                           EXIT_OPERATIONAL)
     conf = read_rb_conf(deps)
+    if conf.get("runBehindTor") != "on":
+        # the start guard would block every mainnet start (tor_off); a refusal keeps Lightning running
+        raise ModuleError("E_TOR_REQUIRED", "refused",
+                          "TunnelSats needs Tor: switch Tor on first (SSH menu > SETTINGS), then REPAIR",
+                          EXIT_REFUSED)
     impl, why = select_impl(conf, args.impl)
     if impl is None:
         raise ModuleError("E_NOT_ELIGIBLE", "not_eligible", "no Lightning implementation to tunnel (%s)" % why,

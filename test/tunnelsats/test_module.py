@@ -799,6 +799,17 @@ class TestRepair(ModuleTestCase):
         self.store(mode="adopted_legacy")
         self.assertEqual(14, self.run_verb("repair", "--yes")["exit_code"])
 
+    def test_tor_off_is_refused_before_anything_changes(self):
+        self.store()
+        self.fake.conf_set("runBehindTor", "off")
+        self.fake.calls.clear()
+        doc = self.run_verb("repair", "--yes")
+        self.assertEqual((14, "E_TOR_REQUIRED", "refused"),
+                         (doc["exit_code"], doc["errors"][0]["code"], doc["errors"][0]["class"]))
+        self.assertIn("SETTINGS", doc["errors"][0]["message"])
+        self.assertEqual([], [c for c in self.fake.calls if c[0] in (mod.ITS, mod.BLITZ_CONF, "systemctl")])
+        self.assertNotIn("tunnelsats=on", self.read_bytes(mod.RB_CONF).decode())
+
 
 # ------------------------------------------------------------------------------------------
 # CHECK

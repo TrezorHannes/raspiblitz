@@ -276,6 +276,19 @@ upstream_repo() {   # $1 = TS_CONTRACT value in the file (default 1)
     grep -q 'tunnelsats-restore' "$FX/journal"
 }
 
+@test "restore: Tor off refuses before anything is installed, with the reason logged and recorded" {
+    active_node lnd
+    conf "runBehindTor=off" "tunnelsats=on" "tunnelsatsImpl='lnd'"
+    run --separate-stderr call its_cmd_restore --json
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.result, .errors[0].code, .errors[0].class' <<< "$output" | tr '\n' ' ')" = "refused E_TOR_REQUIRED refused " ]
+    [[ "$stderr" == *"Tor is off and TunnelSats needs it"* ]]
+    [ ! -e "$FX/dist.calls" ]
+    [ -z "$(find "$TS_RB_UNIT_DIR" -mindepth 1)" ]
+    [ "$(jq -r '.result, .error' "$FX/app-data/tunnelsats/last-restore.json" | tr '\n' ' ')" = "refused E_TOR_REQUIRED " ]
+    grep -q 'Tor is off' "$FX/journal"
+}
+
 @test "restore: stored config missing or not root 0600: exit 3, Lightning stays Tor-only" {
     conf "runBehindTor=on" "tunnelsats=on" "tunnelsatsImpl='lnd'"
     dist_stub

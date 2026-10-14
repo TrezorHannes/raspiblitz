@@ -2030,10 +2030,10 @@ its_restore_record() {   # $1 result, $2 error code
     its_atomic_write "$f" "${doc}"$'\n' 0644 || its_log "# TunnelSats: last-restore.json could not be written"
 }
 
-its_restore_doc() {   # $1 exit code, $2 result, $3 error code
+its_restore_doc() {   # $1 exit code, $2 result, $3 error code, $4 error class (default operational)
     [[ "${R_JSON:-0}" -eq 1 ]] || return 0
     local errors="[]"
-    [[ -n "$3" ]] && errors=$(its_err "$3" operational "restore: $2")
+    [[ -n "$3" ]] && errors=$(its_err "$3" "${4:-operational}" "restore: $2")
     its_doc restore "$1" "$errors" '{result: $result, ln_restarted: (if $r == "true" then true elif $r == "false" then false else null end)}' \
         --arg result "$2" --arg r "${R_RESTARTED:-}"
 }
@@ -2063,6 +2063,12 @@ its_cmd_restore() {
         its_rlog "not active, nothing to restore"
         its_restore_doc 0 not_active ""
         return 0
+    fi
+    if [[ "$(its_conf_get runBehindTor)" != on ]]; then
+        its_rlog "Tor is off and TunnelSats needs it: nothing installed, Lightning does not start while TunnelSats is on. Switch Tor on (SSH menu > SETTINGS), then SSH menu > SUBSCRIBE > TunnelSats > REPAIR, or REMOVE TunnelSats there"
+        its_restore_record refused E_TOR_REQUIRED
+        its_restore_doc 1 refused E_TOR_REQUIRED refused
+        return 1
     fi
     impl=$(its_conf_get tunnelsatsImpl) || impl=""
     case "$impl" in
