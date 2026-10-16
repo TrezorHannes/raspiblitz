@@ -63,6 +63,19 @@ no_temp_files() {
     no_temp_files
 }
 
+@test "the lock on custom-installs.sh holds while the tool clears /run/tunnelsats" {
+    cp "$TEMPLATE" "$TS_RB_CUSTOM"
+    mkdir -m 0755 "$TS_RB_RUN_DIR"
+    here its_block_lock
+    rm -rf "$TS_RB_RUN_DIR"
+    block_json block-insert
+    its_block_unlock
+    [ "$status" -eq 1 ]
+    [ "$(jq -r '.errors[0].code' <<< "$output")" = E_BUSY ]
+    cmp "$TEMPLATE" "$TS_RB_CUSTOM"
+    [ "$(stat -c %a "$TS_RB_LOCK_DIR")" = 700 ]
+}
+
 @test "a file without shebang gets the block at the top; an empty file holds just the block" {
     printf 'echo one\necho two' > "$TS_RB_CUSTOM"
     block_json block-insert

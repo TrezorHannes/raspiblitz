@@ -106,7 +106,7 @@ upstream_repo() {   # $1 = TS_CONTRACT value in the file (default 1)
     [ "$(stat -c %a "$DIST")" = 644 ]
     [ ! -e "$FX/app-data/tunnelsats/dist/tunnelsats-3.1-0123456789ab.sh" ]
     [[ "$(cat "$FX/gitverify.log")" == *" web-flow https://github.com/web-flow.gpg B5690EEEBB952194 ${TS_PIN_COMMIT}" ]]
-    [ -z "$(find "$TS_RB_RUN_DIR" -mindepth 1 -name '.fetch.*')" ]
+    [ -z "$(find "$TS_RB_TOOL_TMP" -mindepth 1 -maxdepth 1 -name '.tunnelsats-*')" ]
 }
 
 @test "fetch online: a bad signature, another sha256 or other contract lines store nothing" {
@@ -154,7 +154,7 @@ while True:
     [ "$(jq -r .error <<< "$output")" = E_DOWNLOAD_FAILED ]
     [[ "$(jq -r '.errors[0].message' <<< "$output")" == *"did not finish within 3 s"* ]]
     [ ! -e "$DIST" ]
-    [ -z "$(find "$TS_RB_RUN_DIR" -mindepth 1 -name '.fetch.*')" ]
+    [ -z "$(find "$TS_RB_TOOL_TMP" -mindepth 1 -maxdepth 1 -name '.tunnelsats-*')" ]
 }
 
 @test "fetch --offline: no copy (exit 3), a copy with another hash is deleted (exit 1), a matching copy is used" {
@@ -264,6 +264,19 @@ while True:
     [ "$(cat "$FX/dist.calls")" = "uninstall --managed --non-interactive --yes --json" ]
 }
 
+@test "tool runs: a tool that clears /run/tunnelsats (uninstall --managed, a failed install's rollback) keeps its document" {
+    local doc="${FIXTURES}/tool/uninstall_disabled.json" sha
+    mkdir -m 0755 "$TS_RB_RUN_DIR"
+    printf 'TUNNELSATS_LND_ARGS=\n' > "${TS_RB_RUN_DIR}/hybrid-lnd.env"
+    printf '#!/bin/bash\nrm -rf -- %q\ncat %q\nexit 0\n' "$TS_RB_RUN_DIR" "$doc" > "$FX/clearing-tool.sh"
+    sha=$(sha256sum "$FX/clearing-tool.sh" | cut -d' ' -f1)
+    run --separate-stderr call its_tool_out 1 uninstall "$FX/clearing-tool.sh" "$sha" 30 uninstall --managed --non-interactive --yes
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(cat "$doc")" ]
+    [ ! -e "$TS_RB_RUN_DIR" ]
+    [ -z "$(find "$TS_RB_TOOL_TMP" -mindepth 1 -maxdepth 1 -name '.tunnelsats-*')" ]
+}
+
 @test "verify: an untrusted installed tool is refused; without an install the stored copy answers" {
     dist_stub
     answer verify verify/not_installed.json
@@ -346,7 +359,7 @@ while True:
     [ "$(jq -r '.result, .error, .tool_version, .ln_restarted' "$FX/app-data/tunnelsats/last-restore.json" | tr '\n' ' ')" = \
         "ok null ${TS_PIN_VERSION} true " ]
     [ "$(stat -c %a "$FX/app-data/tunnelsats/last-restore.json")" = 644 ]
-    [ -z "$(find "$TS_RB_RUN_DIR" -mindepth 1 -name '.run.*')" ]
+    [ -z "$(find "$TS_RB_TOOL_TMP" -mindepth 1 -maxdepth 1 -name '.tunnelsats-*')" ]
 }
 
 @test "restore: CLN maps to --impl cln; an existing managed install is not installed again" {

@@ -49,6 +49,10 @@ its_init_paths() {
     TS_RB_CONF="${TS_RB_CONF:-/mnt/hdd/app-data/raspiblitz.conf}"
     TS_RB_TOOL="${TS_RB_TOOL:-/usr/local/sbin/tunnelsats}"
     TS_RB_RUN_DIR="${TS_RB_RUN_DIR:-/run/tunnelsats}"
+    # The pinned tool's uninstall --managed (and a failed install's rollback) removes the run
+    # directory: private copies of the tool and the locks live next to it, never inside it
+    TS_RB_TOOL_TMP="${TS_RB_TOOL_TMP:-/run}"
+    TS_RB_LOCK_DIR="${TS_RB_LOCK_DIR:-/run/tunnelsats-rb}"
     TS_RB_APPDATA="${TS_RB_APPDATA:-/mnt/hdd/app-data}"
     TS_RB_CUSTOM="${TS_RB_CUSTOM:-/mnt/hdd/app-data/custom-installs.sh}"
     TS_RB_SYSTEMCTL="${TS_RB_SYSTEMCTL:-systemctl}"
@@ -155,10 +159,20 @@ its_run_dir_ok() {
     its_dir_safe "$TS_RB_RUN_DIR"
 }
 
-# Base directory for temporary files: the run directory when it is safe, else TMPDIR.
-its_tmp_base() {
-    if its_dir_safe "$TS_RB_RUN_DIR"; then
-        printf '%s' "$TS_RB_RUN_DIR"
+# Makes sure the lock directory exists (root 0700) and is safe to write to.
+its_lock_dir_ok() {
+    if [[ ! -e "$TS_RB_LOCK_DIR" ]] && [[ ! -L "$TS_RB_LOCK_DIR" ]]; then
+        mkdir -m 0700 -- "$TS_RB_LOCK_DIR" 2>/dev/null || true
+    fi
+    its_dir_safe "$TS_RB_LOCK_DIR"
+}
+
+# Base directory for the private temp directories of tool runs, verify and fetch: TS_RB_TOOL_TMP
+# when it is safe, else TMPDIR. Never the run directory: uninstall --managed removes it while the
+# tool runs, and with it the document of the run.
+its_tool_tmp_base() {
+    if its_dir_safe "$TS_RB_TOOL_TMP"; then
+        printf '%s' "$TS_RB_TOOL_TMP"
     else
         printf '%s' "${TMPDIR:-/tmp}"
     fi
@@ -635,7 +649,7 @@ its_verify_run() {
     local t="$1" dir copy sha
     Q_RC=-1
     Q_DOC=""
-    dir=$(mktemp -d "$(its_tmp_base)/.verify-${G_BASE:-tool}.XXXXXX" 2>/dev/null) || return 1
+    dir=$(mktemp -d "$(its_tool_tmp_base)/.tunnelsats-verify-${G_BASE:-tool}.XXXXXX" 2>/dev/null) || return 1
     ITS_TMPDIRS+=("$dir")
     copy="${dir}/tunnelsats.sh"
     cp -- "$TS_RB_TOOL" "$copy" 2>/dev/null || return 1
@@ -1402,8 +1416,8 @@ its_fetch_online() {
     its_fetch_reset network
     its_now
     F_DEADLINE=$(( NOW_MS + TS_RB_FETCH_BUDGET * 1000 ))
-    if ! its_run_dir_ok || ! its_state_subdir dist || ! d=$(mktemp -d "${TS_RB_RUN_DIR}/.fetch.XXXXXX" 2>/dev/null); then
-        its_fetch_fail E_DOWNLOAD_FAILED operational "the run or state directory cannot be used"
+    if ! its_state_subdir dist || ! d=$(mktemp -d "$(its_tool_tmp_base)/.tunnelsats-fetch.XXXXXX" 2>/dev/null); then
+        its_fetch_fail E_DOWNLOAD_FAILED operational "the temp or state directory cannot be used"
         return 1
     fi
     ITS_TMPDIRS+=("$d")
@@ -1559,7 +1573,7 @@ its_tool_run() {
     shift 3
     X_RC=1
     X_DOC=""
-    dir=$(mktemp -d "$(its_tmp_base)/.run.XXXXXX" 2>/dev/null) || return 1
+    dir=$(mktemp -d "$(its_tool_tmp_base)/.tunnelsats-tool.XXXXXX" 2>/dev/null) || return 1
     ITS_TMPDIRS+=("$dir")
     copy="${dir}/tunnelsats.sh"
     cp -- "$src" "$copy" 2>/dev/null || return 1
@@ -1860,8 +1874,8 @@ its_block_doc() {   # $1 verb, $2 exit code, $3 errors, $4 changed (true|false)
 
 # Takes the lock that serializes changes to custom-installs.sh (fd in B_LOCKFD).
 its_block_lock() {
-    its_run_dir_ok || return 1
-    exec {B_LOCKFD}>"${TS_RB_RUN_DIR}/custom-installs.lock" || return 1
+    its_lock_dir_ok || return 1
+    exec {B_LOCKFD}>"${TS_RB_LOCK_DIR}/custom-installs.lock" || return 1
     flock -w 10 "$B_LOCKFD"
 }
 

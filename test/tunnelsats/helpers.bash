@@ -25,6 +25,8 @@ its_setup() {
     TS_RB_CONF="$FX/conf/raspiblitz.conf"
     TS_RB_TOOL="$FX/bin/tunnelsats"
     TS_RB_RUN_DIR="$FX/run/tunnelsats"
+    TS_RB_TOOL_TMP="$FX/run"
+    TS_RB_LOCK_DIR="$FX/run/tunnelsats-rb"
     TS_RB_APPDATA="$FX/app-data"
     TS_RB_CLN_DIR="$FX/bitcoin/.lightning"
     TS_RB_BOOT_ID="$FX/boot_id"
