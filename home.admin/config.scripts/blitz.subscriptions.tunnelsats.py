@@ -58,7 +58,10 @@ LAST_RESTORE_FILE = STATE_DIR + "/last-restore.json"
 RB_CONF = APPDATA + "/raspiblitz.conf"
 CUSTOM_INSTALLS = APPDATA + "/custom-installs.sh"
 RUN_DIR = "/run/tunnelsats"
-LOCK_FILE = RUN_DIR + "/module.lock"
+# uninstall --managed of the pinned tool (and a failed install's rollback) removes RUN_DIR: the lock
+# lives next to it, in a root 0700 directory of its own
+LOCK_DIR = "/run/tunnelsats-rb"
+LOCK_FILE = LOCK_DIR + "/module.lock"
 STOPPED_UNITS = RUN_DIR + "/stopped-units"
 ITS = "/home/admin/config.scripts/internet.tunnelsats.sh"
 BLITZ_CONF = "/home/admin/config.scripts/blitz.conf.sh"
@@ -67,6 +70,7 @@ LND_ASSET = "/home/admin/assets/lnd.service"
 CL_INSTALL_SERVICE = "/home/admin/config.scripts/cl.install-service.sh"
 LND_UNLOCK = "/home/admin/config.scripts/lnd.unlock.sh"
 CL_HSMTOOL = "/home/admin/config.scripts/cl.hsmtool.sh"
+LNCLI = ["sudo", "-u", "bitcoin", "/usr/local/bin/lncli", "-n=mainnet", "--rpcserver", "localhost:10009"]
 UNIT_DIR = "/etc/systemd/system"
 LEGACY_CONF_RE = re.compile(r"/etc/wireguard/[A-Za-z0-9_.-]{1,64}\.conf")
 
@@ -676,34 +680,35 @@ def load_stored_config(deps):
 
 
 class Lock:
-    """flock on /run/tunnelsats/module.lock: state-changing verbs run one at a time."""
+    """flock on /run/tunnelsats-rb/module.lock: state-changing verbs run one at a time. Not below
+    /run/tunnelsats: uninstall --managed removes that directory while REMOVE or REPAIR holds the lock,
+    and a lock file created again there would let a second verb in."""
 
     def __init__(self, deps, wait):
         self.deps = deps
         self.wait = wait
-        self.handle = None
+        self.fd = None
 
     def __enter__(self):
-        run_dir = self.deps.path(RUN_DIR)
-        if not os.path.isdir(run_dir):
-            os.makedirs(run_dir, exist_ok=True)
-            os.chmod(run_dir, 0o755)
-        self.handle = open(self.deps.path(LOCK_FILE), "a")
+        lock_dir = self.deps.path(LOCK_DIR)
+        os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+        os.chmod(lock_dir, 0o700)
+        self.fd = os.open(self.deps.path(LOCK_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
         deadline = time.monotonic() + self.wait
         while True:
             try:
-                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return self
             except OSError:
                 if time.monotonic() >= deadline:
-                    self.handle.close()
+                    os.close(self.fd)
                     raise ModuleError("E_BUSY", "operational", "another TunnelSats action is running",
                                       EXIT_OPERATIONAL) from None
                 time.sleep(0.5)
 
     def __exit__(self, *exc):
-        fcntl.flock(self.handle, fcntl.LOCK_UN)
-        self.handle.close()
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
 
 
 # ------------------------------------------------------------------------------------------
@@ -1275,7 +1280,7 @@ def has_flags(impl, args):
 
 def lightning_info(deps, impl):
     if impl == "lnd":
-        argv = ["sudo", "-u", "bitcoin", "/usr/local/bin/lncli", "-n=mainnet", "--rpcserver", "localhost:10009", "getinfo"]
+        argv = LNCLI + ["getinfo"]
     else:
         argv = ["sudo", "-u", "bitcoin", "/usr/local/bin/lightning-cli", "--conf=/home/bitcoin/.lightning/config", "getinfo"]
     rc, out, _err = deps.run(argv, timeout=30)
@@ -1490,6 +1495,96 @@ def cmd_check(deps, args, result):
 # uninstall (REMOVE)
 # ------------------------------------------------------------------------------------------
 
+def tool_uninstall(deps, unit):
+    """uninstall --managed of the pinned tool, for REMOVE and REPAIR. Returns its document, with
+    "remaining" the list of what is left, and a note for the result or None. If the document does
+    not arrive (no list "remaining": a timeout, a crash, no single JSON document), the outcome is
+    read back instead of assumed: detect for the dataplane, systemd for unit before and after. A
+    lost report never turns a done removal into a failed one, and never a failed one into a done one."""
+    before = unit_props(deps, unit, "ActiveState", "UnitFileState") if unit else {}
+    rc, doc = its(deps, ["uninstall", "--json"], timeout=ITS_TIMEOUT["uninstall"])
+    doc = doc if isinstance(doc, dict) else {}
+    if isinstance(doc.get("remaining"), list):
+        return dict(doc, remaining=doc["remaining"] or ([] if rc == 0 else ["managed dataplane"])), None
+    _rc, found = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
+    kind = ((found or {}).get("install") or {}).get("kind")
+    removed = isinstance(kind, str) and kind not in ("managed", "unknown")
+    after = unit_props(deps, unit, "ActiveState", "UnitFileState") if unit else {}
+    read = {"unit": unit, "remaining": [] if removed else ["managed dataplane"],
+            "ln_was_active": before.get("ActiveState") not in (None, "", "inactive", "failed"),
+            "ln_disabled": (before.get("UnitFileState") in ("enabled", "enabled-runtime")
+                            and after.get("UnitFileState") == "disabled"),
+            "ln_started": after.get("ActiveState") == "active", "node_config": "unknown"}
+    if removed:
+        seen = "the dataplane is removed"
+    elif isinstance(kind, str):
+        seen = "the dataplane is still there"
+    else:
+        seen = "detect did not answer, so the removal counts as incomplete"
+    note = "the report of the TunnelSats uninstall did not arrive (%s); read back from the system: %s" % (
+        tool_error(doc, "E_TOOL_OUTPUT"), seen)
+    return read, note
+
+
+def announce_candidates(deps, state, record):
+    """The VPN addresses (<ipv4>:<port>) LND may announce. LND resolves externalhosts itself and
+    announces the IPv4 it got: the endpoint's IPv4 at the last start (guard record, read before
+    uninstall removes /run/tunnelsats) and now, with the port of the guard record and of the
+    stored subscription."""
+    announce = (record or {}).get("announce") or {}
+    ipv4s = {public_ipv4(announce.get("ipv4"))}
+    host = (state or {}).get("endpoint_host")
+    if valid_host(host):
+        rc, out, _err = deps.run(["getent", "ahostsv4", host], timeout=10)
+        if rc == 0:
+            ipv4s.update(public_ipv4(line.split()[0]) for line in out.splitlines() if line.split())
+    ports = {port for port in (announce.get("port"), (state or {}).get("vpn_port")) if valid_port(port)}
+    return sorted("%s:%d" % (ipv4, port) for ipv4 in ipv4s if ipv4 for port in ports)
+
+
+def announce_command(addresses):
+    return " ".join(LNCLI + ["peers", "updatenodeannouncement"] +
+                    [arg for address in addresses for arg in ("--address_remove", address)])
+
+
+def announce_cleanup(deps, unit, state, record, wait=120, step=5):
+    """REMOVE, LND only. LND saves the addresses it announces and announces them again at every
+    start when its config sets no externalip, so after REMOVE it would go on announcing the VPN
+    address. This takes exactly the VPN address (announce_candidates) out of LND's node
+    announcement once LND answers, never the onion address or any other one. Returns the outcome
+    (removed, none, lnd_not_ready, failed; skipped for CLN) and notes for the result."""
+    if unit != UNITS["lnd"]:
+        return "skipped", []
+    candidates = announce_candidates(deps, state, record)
+    if not candidates:
+        return "none", []
+    info = None
+    if unit_props(deps, unit, "ActiveState")["ActiveState"] in ("active", "activating", "reloading"):
+        started, waited = deps.clock(), 0
+        info = lightning_info(deps, "lnd")
+        while info is None and waited < wait and (deps.clock() - started).total_seconds() < wait:
+            deps.sleep(step)
+            waited += step
+            info = lightning_info(deps, "lnd")
+    if info is None:
+        return "lnd_not_ready", ["LND did not answer (stopped, locked or still starting). Once it runs, take the "
+                                 "VPN address out of its node announcement, which LND keeps from its last start: %s"
+                                 % announce_command(candidates)]
+    announced = {u.split("@", 1)[1] for u in info.get("uris") or [] if isinstance(u, str) and "@" in u}
+    stale = [address for address in candidates if address in announced]
+    if not stale:
+        return "none", []
+    failed = []
+    for address in stale:
+        rc, _out, _err = deps.run(LNCLI + ["peers", "updatenodeannouncement", "--address_remove", address], timeout=30)
+        if rc != 0:
+            failed.append(address)
+    if failed:
+        return "failed", ["LND still announces the VPN address %s; run: %s"
+                          % (", ".join(failed), announce_command(failed))]
+    return "removed", []
+
+
 def zero_artifacts(deps, impl, conf_flag_off_expected=True):
     """What is left after REMOVE (design 6.6 step 10)."""
     leftovers = []
@@ -1579,9 +1674,9 @@ def at_rest_action(impl, doc, unit, then):
 
 
 def keep_pending_removal(deps, unit, doc):
-    """Records in state.json that a refused REMOVE left unit stopped (and disabled, per uninstall
-    document doc): the menu then offers REMOVE again instead of START, and the next REMOVE enables
-    and starts the unit once its config is Tor-only at rest."""
+    """Records in state.json that a refused or unfinished REMOVE left unit stopped (and disabled,
+    per uninstall document doc): the menu then offers REMOVE again instead of START, and the next
+    REMOVE enables and starts the unit once the removal is complete and its config is Tor-only at rest."""
     if not unit or not (doc.get("ln_disabled") or (doc.get("ln_was_active") and not doc.get("ln_started"))):
         return
     state = load_state(deps)
@@ -1618,7 +1713,7 @@ def cmd_uninstall(deps, args, result):
     conf = read_rb_conf(deps)
     result.fields.update({"removed": False, "remaining": [], "ln_was_active": False, "ln_started": False,
                           "ln_reenabled": False, "node_config": None, "block": None, "purged": False,
-                          "artifacts": []})
+                          "artifacts": [], "announce_cleanup": None})
     if state and state.get("mode") == "adopted_legacy":
         with Lock(deps, wait=30):
             purge(deps)
@@ -1632,6 +1727,8 @@ def cmd_uninstall(deps, args, result):
     impl = (state or {}).get("impl") or conf.get("tunnelsatsImpl")
     impl = impl if impl in IMPLS else select_impl(conf)[0]
     with Lock(deps, wait=30):
+        # the address LND announced at its last start, read before uninstall removes /run/tunnelsats
+        record = read_guard_record(deps, BASES["lnd"])
         blitz_conf_set(deps, "tunnelsats", "off")
         try:
             for entry in os.listdir(deps.path(RUN_DIR)):
@@ -1644,13 +1741,20 @@ def cmd_uninstall(deps, args, result):
         deps.run([ITS, "tick-timer", "off"], timeout=60)
         unit = UNITS.get(impl)
         doc = {}
+        notes = []
+        result.fields["warnings"] = notes
         if managed:
-            rc, doc = its(deps, ["uninstall", "--json"], timeout=ITS_TIMEOUT["uninstall"])
-            doc = doc or {}
-            result.fields.update({"remaining": doc.get("remaining") or ([] if rc == 0 else ["managed dataplane"]),
-                                  "ln_was_active": bool(doc.get("ln_was_active")),
-                                  "ln_started": bool(doc.get("ln_started")), "node_config": doc.get("node_config")})
+            # an earlier REMOVE that did not finish may have stopped the unit (read while it is stopped)
+            pending = pending_removal(deps, state)
+            doc, note = tool_uninstall(deps, unit)
+            if note:
+                notes.append(note)
             unit = doc.get("unit") if doc.get("unit") in UNITS.values() else unit
+            if pending and pending["unit"] == unit:
+                doc = dict(doc, ln_was_active=bool(doc.get("ln_was_active")) or pending["ln_was_active"],
+                           ln_disabled=bool(doc.get("ln_disabled")) or pending["ln_disabled"])
+            result.fields.update({"remaining": doc["remaining"], "ln_was_active": bool(doc.get("ln_was_active")),
+                                  "ln_started": bool(doc.get("ln_started")), "node_config": doc.get("node_config")})
         else:
             # a REMOVE refused earlier (config not Tor-only at rest) kept this unit stopped: this run
             # audits it again and enables and starts it only if the config is Tor-only now
@@ -1678,6 +1782,8 @@ def cmd_uninstall(deps, args, result):
         if complete and main_ok and doc.get("ln_was_active") and not doc.get("ln_started") and unit:
             result.fields["ln_started"] = systemctl(deps, "start", unit)
         if not complete:
+            # the next REMOVE finds the unit stopped by this one in remove_pending and starts it again
+            keep_pending_removal(deps, unit, doc)
             result.error("E_REMOVE_INCOMPLETE", "operational",
                          "removal incomplete: %s; Lightning stays stopped, run REMOVE again" %
                          ", ".join(result.fields["remaining"]), EXIT_OPERATIONAL)
@@ -1711,6 +1817,8 @@ def cmd_uninstall(deps, args, result):
                          "%s. Remove the listed TunnelSats settings%s" % (
                              "; ".join(messages), ", then run: sudo %s" % then if then else ""), EXIT_OPERATIONAL)
             return
+        cleanup, cleanup_notes = announce_cleanup(deps, unit, state, record)
+        result.fields["announce_cleanup"] = cleanup
         leftovers, warnings = zero_artifacts(deps, impl)
         if other_action:
             result.fields["other_impl_lines"] = other_action["lines"]
@@ -1720,7 +1828,7 @@ def cmd_uninstall(deps, args, result):
                                    "remove these settings: %s" % "; ".join(other_action["lines"])
                                    if other_action["lines"] else "check its config"))
         result.fields["artifacts"] = leftovers
-        result.fields["warnings"] = warnings
+        result.fields["warnings"] = notes + warnings + cleanup_notes
         if leftovers:
             result.error("E_ARTIFACTS_LEFT", "operational", "left behind: %s" % "; ".join(leftovers), EXIT_OPERATIONAL)
             return
@@ -1781,10 +1889,12 @@ def cmd_repair(deps, args, result):
         unit = UNITS[impl]
         was_active = unit_props(deps, unit, "ActiveState")["ActiveState"] == "active"
         if managed and (not current_tool or state.get("impl") != impl or not dataplane_healthy(deps, impl)):
-            rc, doc = its(deps, ["uninstall", "--json"], timeout=ITS_TIMEOUT["uninstall"])
+            # the unit of the old install: the one of the stored implementation
+            doc, note = tool_uninstall(deps, UNITS[state["impl"]] if state.get("impl") in IMPLS else unit)
             actions.append("uninstall")
-            doc = doc or {}
-            if rc != 0 or doc.get("remaining"):
+            if note:
+                result.fields["warnings"] = [note]
+            if doc["remaining"]:
                 raise ModuleError("E_REMOVE_INCOMPLETE", "operational",
                                   "the old dataplane could not be removed; Lightning stays stopped", EXIT_OPERATIONAL)
             if doc.get("ln_disabled") and doc.get("unit") in UNITS.values():

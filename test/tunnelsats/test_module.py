@@ -66,6 +66,9 @@ class FakeSystem:
         self.sleeps = []
         self.notify_rc = 0
         self.real_guard = False
+        self.stateful = False
+        self.getent = {}
+        self.announce_rc = 0
         self.its = {
             "audit lnd": (0, {"status": "clean", "eligible": True, "keys": [], "reason": None,
                               "not_eligible_reason": None}),
@@ -90,9 +93,10 @@ class FakeSystem:
         }
         self.units = {
             "lnd.service": {"ActiveState": "active", "InvocationID": INVOCATION, "MainPID": "4242",
-                            "ControlGroup": "/tunnelsats.slice/lnd.service",
+                            "ControlGroup": "/tunnelsats.slice/lnd.service", "UnitFileState": "enabled",
                             "FragmentPath": "/etc/systemd/system/lnd.service", "NeedDaemonReload": "no"},
             "lightningd.service": {"ActiveState": "inactive", "InvocationID": "", "MainPID": "0", "ControlGroup": "",
+                                   "UnitFileState": "disabled",
                                    "FragmentPath": "/etc/systemd/system/lightningd.service", "NeedDaemonReload": "no"},
         }
         # LND resolves externalhosts and announces the resolved address (1.2.3.4 = endpoint.ipv4)
@@ -121,6 +125,8 @@ class FakeSystem:
             answer = self.its.get(key, (127, ""))
             if isinstance(answer, list):
                 answer = answer.pop(0) if len(answer) > 1 else answer[0]
+            if callable(answer):
+                answer = answer()
             rc, doc = answer
             return rc, doc if isinstance(doc, str) else json.dumps(doc), ""
         if prog == "systemctl":
@@ -129,7 +135,15 @@ class FakeSystem:
                 props = [argv[i + 1] for i in range(len(argv)) if argv[i] == "-p"]
                 values = self.units.get(unit, {})
                 return 0, "".join("%s=%s\n" % (p, values.get(p, "")) for p in props), ""
+            if self.stateful and argv[-1] in self.units:
+                state = {"start": ("ActiveState", "active"), "restart": ("ActiveState", "active"),
+                         "stop": ("ActiveState", "inactive"), "enable": ("UnitFileState", "enabled"),
+                         "disable": ("UnitFileState", "disabled")}.get(argv[1])
+                if state:
+                    self.units[argv[-1]][state[0]] = state[1]
             return 0, "", ""
+        if prog == "getent":
+            return self.getent.get(argv[-1], (2, "")) + ("",)
         if prog == "install":
             shutil.copy(os.path.join(REPO, "home.admin", "assets", "lnd.service"),
                         os.path.join(self.root, argv[-1].lstrip("/")))
@@ -137,6 +151,11 @@ class FakeSystem:
         if prog == "wg":
             return 0, self.wg.get(argv[3], ""), ""
         if prog == "sudo":
+            if "updatenodeannouncement" in argv:
+                if self.announce_rc == 0 and self.getinfo is not None:
+                    gone = argv[argv.index("--address_remove") + 1]
+                    self.getinfo["uris"] = [u for u in self.getinfo["uris"] if not u.endswith("@" + gone)]
+                return self.announce_rc, "{}" if self.announce_rc == 0 else "", "" if self.announce_rc == 0 else "rpc error"
             return (0, json.dumps(self.getinfo), "") if self.getinfo is not None else (1, "", "locked")
         if prog == mod.NOTIFY:
             return self.notify_rc, "", ""
@@ -241,6 +260,23 @@ class ModuleTestCase(unittest.TestCase):
     def activate_conf(self, impl="lnd"):
         self.fake.conf_set("tunnelsats", "on")
         self.fake.conf_set("tunnelsatsImpl", impl)
+
+    def lose_the_report(self, still_managed=False):
+        """uninstall --managed does its work (stops and disables LND, removes /run/tunnelsats and,
+        unless still_managed, the dataplane) but its report does not arrive: E_TOOL_OUTPUT, as on
+        the VM when the private copy ran below /run/tunnelsats (QA round 4c)."""
+        fake = self.fake
+        fake.stateful = True
+
+        def uninstall():
+            fake.units["lnd.service"].update({"ActiveState": "inactive", "UnitFileState": "disabled"})
+            shutil.rmtree(self.path("run/tunnelsats"), ignore_errors=True)
+            return 1, {"contract": 1, "command": "uninstall", "ok": False, "exit_code": 1, "errors": [
+                {"code": "E_TOOL_OUTPUT", "class": "operational",
+                 "message": "tunnelsats.sh uninstall printed no single JSON document (exit 0)"}]}
+        fake.its["uninstall"] = uninstall
+        if still_managed:
+            fake.its["detect"] = (0, fixture_json("tool", "detect_managed.json"))
 
     def run_verb(self, *argv):
         out = io.StringIO()
@@ -470,12 +506,18 @@ class TestApi(ModuleTestCase):
         self.ask((500, {}, b'{"error":"ERR_INTERNAL_ERROR","message":"body-marker"}'))
         self.assertFalse(any("marker" in line for line in self.logs))
 
-    def test_lock_keeps_the_run_directory_readable(self):
+    def test_the_lock_holds_while_the_tool_clears_its_run_directory(self):
+        # uninstall --managed (and a failed install's rollback) removes /run/tunnelsats while REMOVE
+        # or REPAIR holds the lock: the lock lives in its own root 0700 directory
         shutil.rmtree(self.path("run/tunnelsats"))
-        os.umask(0o077)
         with mod.Lock(self.deps, wait=0):
-            pass
-        self.assertEqual(0o755, os.stat(self.path("run/tunnelsats")).st_mode & 0o777)
+            shutil.rmtree(self.path("run/tunnelsats"), ignore_errors=True)
+            with self.assertRaises(mod.ModuleError) as caught:
+                with mod.Lock(self.deps, wait=0):
+                    pass
+            self.assertEqual("E_BUSY", caught.exception.code)
+        self.assertFalse(os.path.exists(self.path("run/tunnelsats")))
+        self.assertEqual(0o700, os.stat(self.path("run/tunnelsats-rb")).st_mode & 0o777)
 
 
 API_URL = "https://tunnelsats.com/api/public/v1/subscription/status"
@@ -934,6 +976,149 @@ class TestRemove(ModuleTestCase):
         self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
         self.assertNotIn("remove_pending", mod.load_state(self.deps))
 
+    # -- the tool's report lost on the way (QA round 4c) ------------------------------------
+    def pending(self):
+        pending = mod.load_state(self.deps).get("remove_pending") or {}
+        return {key: pending.get(key) for key in ("unit", "ln_was_active", "ln_disabled")}
+
+    def lnd_state(self):
+        return {key: self.fake.units["lnd.service"][key] for key in ("ActiveState", "UnitFileState")}
+
+    def test_a_report_that_arrives_is_used_as_it_is(self):
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, []), (doc["exit_code"], doc["removed"], doc["warnings"]), doc)
+        # detect before the removal and for the zero-artifacts check: nothing is read back
+        self.assertEqual(2, len(self.fake.calls_of(mod.ITS, "detect")))
+
+    def test_a_lost_report_is_read_back_and_lightning_started_after_the_own_audit(self):
+        # TC-34: the dataplane is gone and LND stopped and disabled; only the report is missing
+        self.lose_the_report()
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, [], "unknown"),
+                         (doc["exit_code"], doc["removed"], doc["remaining"], doc["node_config"]), doc)
+        self.assertTrue(doc["ln_was_active"] and doc["ln_reenabled"] and doc["ln_started"])
+        f = self.fake
+        uninstall = f.calls.index([mod.ITS, "uninstall", "--json"])
+        read_back = f.calls.index([mod.ITS, "detect", "--json"], uninstall)
+        audit = f.calls.index([mod.ITS, "audit", "lnd", "--repair", "--json"])
+        self.assertTrue(uninstall < read_back < audit < f.calls.index(["systemctl", "enable", "lnd.service"])
+                        < f.calls.index(["systemctl", "start", "lnd.service"]))
+        self.assertEqual({"ActiveState": "active", "UnitFileState": "enabled"}, self.lnd_state())
+        self.assertIn("E_TOOL_OUTPUT", doc["warnings"][0])
+        self.assertNotIn("remove_pending", mod.load_state(self.deps))
+
+    def test_a_lost_report_and_a_config_not_tor_only_keep_lightning_stopped_for_remove_again(self):
+        # R4-8
+        self.lose_the_report()
+        self.fake.its["audit lnd --repair"] = (1, self.audit("unrepairable", "tor_inactive", [self.LINE],
+                                                             ["externalhosts"]))
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stays_stopped(doc)
+        self.assertEqual(([self.LINE], "systemctl enable --now lnd.service"),
+                         (doc["action_required"]["lines"], doc["action_required"]["then"]))
+        self.assertEqual({"unit": "lnd.service", "ln_was_active": True, "ln_disabled": True}, self.pending())
+        self.assertIn("E_TOOL_OUTPUT", doc["warnings"][0])
+
+    def test_a_lost_report_with_the_dataplane_still_there_is_incomplete_and_remove_again_starts_lightning(self):
+        # TC-36
+        self.lose_the_report(still_managed=True)
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((1, "E_REMOVE_INCOMPLETE", ["managed dataplane"]),
+                         (doc["exit_code"], doc["errors"][0]["code"], doc["remaining"]), doc)
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
+        self.assertEqual({"unit": "lnd.service", "ln_was_active": True, "ln_disabled": True}, self.pending())
+        # REMOVE again: the report arrives, but the first run already stopped and disabled LND
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+        uninstall.update({"ln_was_active": False, "ln_disabled": False})
+        self.fake.its["uninstall"] = (0, uninstall)
+        self.fake.its["detect"] = [(0, fixture_json("tool", "detect_managed.json")),
+                                   (0, fixture_json("tool", "detect_none.json"))]
+        self.fake.calls.clear()
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True), (doc["exit_code"], doc["removed"]), doc)
+        self.assertTrue(doc["ln_was_active"] and doc["ln_reenabled"] and doc["ln_started"])
+        self.assertEqual({"ActiveState": "active", "UnitFileState": "enabled"}, self.lnd_state())
+        self.assertNotIn("remove_pending", mod.load_state(self.deps))
+
+    # -- the VPN address in LND's node announcement -----------------------------------------
+    REMOVE_ADDRESS = ["sudo", "-u", "bitcoin", "/usr/local/bin/lncli", "-n=mainnet", "--rpcserver", "localhost:10009",
+                      "peers", "updatenodeannouncement", "--address_remove", "1.2.3.4:24556"]
+
+    def announcement_updates(self):
+        return [c for c in self.fake.calls if "updatenodeannouncement" in c]
+
+    def test_the_vpn_address_is_taken_out_of_the_node_announcement_of_lnd(self):
+        # LND saves the addresses it announces and announces them again at the next start, also
+        # without TunnelSats; the guard record names the address, read before uninstall removes it
+        self.record(ipv4="1.2.3.4")
+        self.fake.getinfo["uris"].append("0280a@203.0.113.7:9735")
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+
+        def uninstall_clears_the_run_directory():
+            shutil.rmtree(self.path("run/tunnelsats"))
+            return 0, uninstall
+        self.fake.its["uninstall"] = uninstall_clears_the_run_directory
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, "removed", []),
+                         (doc["exit_code"], doc["removed"], doc["announce_cleanup"], doc["warnings"]), doc)
+        self.assertEqual([self.REMOVE_ADDRESS], self.announcement_updates())
+        self.assertLess(self.fake.calls.index(["systemctl", "start", "lnd.service"]),
+                        self.fake.calls.index(self.REMOVE_ADDRESS))
+        # the onion address and every other address stay
+        self.assertEqual(["0280a@exampleonion.onion:9735", "0280a@203.0.113.7:9735"], self.fake.getinfo["uris"])
+
+    def test_without_a_guard_record_the_endpoint_is_looked_up(self):
+        self.fake.getent["de2.tunnelsats.com"] = (0, "1.2.3.4         STREAM de2.tunnelsats.com\n"
+                                                     "1.2.3.4         DGRAM  \n")
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, "removed"), (doc["exit_code"], doc["announce_cleanup"]), doc)
+        self.assertIn(["getent", "ahostsv4", "de2.tunnelsats.com"], self.fake.calls)
+        self.assertEqual([self.REMOVE_ADDRESS], self.announcement_updates())
+
+    def test_nothing_is_taken_out_when_lnd_does_not_announce_the_vpn_address(self):
+        self.record(ipv4="1.2.3.4")
+        self.fake.getinfo["uris"] = ["0280a@exampleonion.onion:9735"]
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, "none", []), (doc["exit_code"], doc["announce_cleanup"], doc["warnings"]), doc)
+        self.assertEqual([], self.announcement_updates())
+
+    def test_lnd_not_answering_in_time_leaves_the_command_as_a_note(self):
+        self.record(ipv4="1.2.3.4")
+        self.fake.getinfo = None
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, "lnd_not_ready"), (doc["exit_code"], doc["removed"], doc["announce_cleanup"]), doc)
+        self.assertEqual([5] * 24, self.fake.sleeps)
+        self.assertIn(" ".join(self.REMOVE_ADDRESS), doc["warnings"][-1])
+        self.assertIn(" ".join(self.REMOVE_ADDRESS), mod.result_text(doc))
+        self.assertEqual([], self.announcement_updates())
+
+    def test_lnd_not_running_after_remove_leaves_the_command_as_a_note_without_waiting(self):
+        self.record(ipv4="1.2.3.4")
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+        uninstall.update({"ln_was_active": False, "ln_disabled": False})
+        self.fake.its["uninstall"] = (0, uninstall)
+        self.fake.units["lnd.service"]["ActiveState"] = "inactive"
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, "lnd_not_ready", []), (doc["exit_code"], doc["announce_cleanup"], self.fake.sleeps), doc)
+        self.assertIn(" ".join(self.REMOVE_ADDRESS), doc["warnings"][-1])
+
+    def test_a_failed_update_leaves_the_command_as_a_note(self):
+        self.record(ipv4="1.2.3.4")
+        self.fake.announce_rc = 1
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, "failed"), (doc["exit_code"], doc["removed"], doc["announce_cleanup"]), doc)
+        self.assertEqual([self.REMOVE_ADDRESS], self.announcement_updates())
+        self.assertIn(" ".join(self.REMOVE_ADDRESS), doc["warnings"][-1])
+
+    def test_cln_is_skipped(self):
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+        uninstall["unit"] = "lightningd.service"
+        self.fake.its["uninstall"] = (0, uninstall)
+        self.record(ipv4="1.2.3.4", base="lightningd")
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, "skipped"), (doc["exit_code"], doc["removed"], doc["announce_cleanup"]), doc)
+        self.assertEqual([], [c for c in self.fake.calls if c[0] == "sudo"])
+
 
 class TestMenu(ModuleTestCase):
     """The menu entries (menu_choices) and its START and RESTART action (menu_start); the dialog
@@ -1047,6 +1232,44 @@ class TestRepair(ModuleTestCase):
                          (doc["action_required"]["lines"], doc["action_required"]["then"]))
         self.assertEqual(["uninstall"], doc["actions"])
         self.assertEqual([], self.fake.calls_of("systemctl", "enable"))
+        self.assertEqual(-1, self.fake.index_of(mod.ITS, "install"))
+
+    def older_tool(self):
+        self.store()
+        self.activate_conf()
+        self.fake.its["detect"] = [(0, fixture_json("tool", "detect_managed.json")),
+                                   (0, fixture_json("tool", "detect_none.json"))]
+        self.fake.its["status"] = (0, {"tool_hash": "accepted_older"})
+
+    def test_a_lost_report_is_read_back_and_a_config_not_tor_only_keeps_lightning_stopped(self):
+        # R4-6: the old dataplane is gone and LND stopped and disabled; the report is missing
+        self.older_tool()
+        self.lose_the_report()
+        line = "/mnt/hdd/app-data/lnd/lnd.conf:8:externalhosts=de2.tunnelsats.com:24556"
+        self.fake.its["audit lnd --repair"] = (1, {"status": "unrepairable", "reason": "backup_failed",
+                                                   "keys": ["externalhosts"], "lines": [line]})
+        doc = self.run_verb("repair", "--yes")
+        self.assertEqual((1, "E_AT_REST_UNREPAIRABLE"), (doc["exit_code"], doc["errors"][0]["code"]), doc)
+        self.assertEqual(([line], "systemctl enable --now lnd.service"),
+                         (doc["action_required"]["lines"], doc["action_required"]["then"]))
+        self.assertEqual(["uninstall"], doc["actions"])
+        self.assertIn("E_TOOL_OUTPUT", doc["warnings"][0])
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable"))
+        self.assertEqual(-1, self.fake.index_of(mod.ITS, "install"))
+
+    def test_a_lost_report_and_a_tor_only_config_go_on_with_the_install(self):
+        self.older_tool()
+        self.lose_the_report()
+        doc = self.run_verb("repair", "--yes")
+        self.assertEqual(["uninstall", "reenable", "install"], doc["actions"][:3], doc)
+        self.assertIn("E_TOOL_OUTPUT", doc["warnings"][0])
+
+    def test_a_lost_report_with_the_old_dataplane_still_there_stops_repair(self):
+        self.older_tool()
+        self.lose_the_report(still_managed=True)
+        doc = self.run_verb("repair", "--yes")
+        self.assertEqual((1, "E_REMOVE_INCOMPLETE"), (doc["exit_code"], doc["errors"][0]["code"]), doc)
+        self.assertEqual(["uninstall"], doc["actions"])
         self.assertEqual(-1, self.fake.index_of(mod.ITS, "install"))
 
     def test_healthy_install_only_reapplies_block_and_timer(self):
