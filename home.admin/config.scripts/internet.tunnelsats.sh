@@ -20,9 +20,9 @@
 # ---------------------------------------------------------------------------------------------
 
 TS_PIN_VERSION="3.2"
-# web-flow signed squash merge on Tunnelsats/tunnelsats main (its PR 230, on top of PR 227)
-TS_PIN_COMMIT="49b72e3ca2c29ebb4c7d8db885560d07ae25f082"
-TS_PIN_SHA256="2ac2f2d9b5879419590d6faec9781b0a783fe3071c68d9e0bf72567e2015c72d"
+# web-flow signed squash merge on Tunnelsats/tunnelsats main (its PR 233, on top of PR 230 and PR 227)
+TS_PIN_COMMIT="36513ae7ca6685aaaad486d9a88baff2716a0a2d"
+TS_PIN_SHA256="b1c0998c70dcaab6928120250d249f775d24c5f736abc24e611591126f67d048"
 TS_PIN_SIGNER="web-flow"
 TS_PIN_KEY_URL="https://github.com/web-flow.gpg"
 # issuer of the signature of the pinned commit
@@ -81,6 +81,7 @@ TunnelSats on RaspiBlitz (root only, except status)
   internet.tunnelsats.sh audit <lnd|cl> [--repair] [--json]
   internet.tunnelsats.sh fetch [--offline] [--json]
   internet.tunnelsats.sh install --impl <lnd|cl> [--json]
+  internet.tunnelsats.sh adopt --impl <lnd|cl> [--json]
   internet.tunnelsats.sh uninstall [--json]
   internet.tunnelsats.sh verify [--no-probe] [--json]
   internet.tunnelsats.sh detect [--json]
@@ -1677,6 +1678,51 @@ its_cmd_install() {
         --config "$conf" --non-interactive --yes
 }
 
+# adopt --impl <lnd|cl> [--json]: the verified stored copy runs adopt --managed raspiblitz.
+its_cmd_adopt() {
+    local impl="" cimpl json=0 dev=0 conf src sha rc
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --impl) impl="${2:-}"; shift ;;
+            --json) json=1 ;;
+            --dev-override) dev=1 ;;
+            *) its_usage >&2; return 2 ;;
+        esac
+        shift
+    done
+    case "$impl" in
+        lnd) cimpl="lnd" ;;
+        cl) cimpl="cln" ;;
+        *) its_fail_doc adopt 2 E_USAGE usage "adopt needs --impl lnd or --impl cl"; return 2 ;;
+    esac
+    its_require_root adopt || return 2
+    its_run_dir_ok || true
+    conf="$(its_state_dir)/tunnelsats.conf"
+    if ! its_stored_conf_ok "$conf"; then
+        its_fail_doc adopt 3 E_NOT_CONFIGURED not_configured "no stored TunnelSats config (root 0600 with PrivateKey and Endpoint)"
+        return 3
+    fi
+    if [[ "$dev" -eq 1 ]]; then
+        src="$(its_state_dir)/dist/dev-override.sh"
+        sha=$(its_dev_override_sha)
+        if [[ -z "$sha" ]] || [[ ! -f "$src" ]]; then
+            its_fail_doc adopt 1 E_DEV_OVERRIDE refused "no development override registered for this boot"
+            return 1
+        fi
+    else
+        its_fetch_offline
+        rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            its_fail_doc adopt "$rc" "$F_CODE" "$F_CLASS" "$F_MSG"
+            return "$rc"
+        fi
+        src="$F_PATH"
+        sha="$TS_PIN_SHA256"
+    fi
+    its_tool_out "$json" adopt "$src" "$sha" 900 adopt --managed raspiblitz --impl "$cimpl" --network mainnet \
+        --config "$conf" --non-interactive --yes
+}
+
 # Selects the installed tool when it is trusted, else the verified stored copy. Sets S_SRC, S_SHA.
 its_select_tool() {
     if its_tool_trust; then
@@ -2293,6 +2339,7 @@ main() {
         status) its_cmd_status "$@" ;;
         fetch) its_cmd_fetch "$@" ;;
         install) its_cmd_install "$@" ;;
+        adopt) its_cmd_adopt "$@" ;;
         uninstall) its_cmd_uninstall "$@" ;;
         verify) its_cmd_verify "$@" ;;
         detect) its_cmd_detect "$@" ;;
