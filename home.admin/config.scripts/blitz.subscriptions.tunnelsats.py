@@ -110,6 +110,11 @@ TOOL_ANNOUNCE_RESULTS = ("removed", "none", "lnd_not_ready", "failed", "skipped"
 BOOT_OFF = ("disabled", "masked", "masked-runtime")
 # an IPv4 address with a port, as the tool's announcement warnings name them
 ADDRESS_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b")
+# REPAIR and IMPORT check the node only once the Lightning unit the tool or the module (re)started
+# has left "activating" (LND until it is ready, Type=notify; verify reports such a start as
+# degraded): at most LN_START_WAIT seconds, read every LN_START_STEP seconds
+LN_START_WAIT = 90
+LN_START_STEP = 3
 
 # Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
 KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
@@ -989,6 +994,54 @@ def wait_for_handshake(deps, seconds=60, step=5):
         waited += step
 
 
+def wait_until_started(deps, unit, limit=LN_START_WAIT, step=LN_START_STEP):
+    """REPAIR and IMPORT, before their final check, after the tool or the module (re)started unit:
+    waits while it is "activating" (LND until it is ready, Type=notify), at most limit seconds,
+    because verify reports a start in progress as degraded. Returns the record for the result:
+    unit, state (read last), waited_s and outcome: "active", "not_running" (it was not starting),
+    "failed" (it stopped while starting) or "timeout" (still starting at the limit)."""
+    started, waited = deps.clock(), 0
+    state = unit_props(deps, unit, "ActiveState")["ActiveState"]
+    starting = state == "activating"
+    while state == "activating" and waited < limit and (deps.clock() - started).total_seconds() < limit:
+        deps.sleep(step)
+        waited += step
+        state = unit_props(deps, unit, "ActiveState")["ActiveState"]
+    if state == "active":
+        outcome = "active"
+    elif state == "activating":
+        outcome = "timeout"
+    else:
+        outcome = "failed" if starting else "not_running"
+    return {"unit": unit, "state": state or "unknown", "waited_s": waited, "outcome": outcome}
+
+
+def start_wait_detail(wait):
+    """Why the final check saw a start that did not finish, or None."""
+    if not wait:
+        return None
+    if wait["outcome"] == "timeout":
+        hint = " (LND stays starting until its wallet is unlocked)" if wait["unit"] == UNITS["lnd"] else ""
+        return ("%s was still starting after %d s, so this check ran while it starts%s: run CHECK again once it "
+                "runs" % (wait["unit"], wait["waited_s"], hint))
+    if wait["outcome"] == "failed":
+        return ("%s stopped while starting (%s): see journalctl -u %s, then REPAIR"
+                % (wait["unit"], wait["state"], wait["unit"]))
+    return None
+
+
+def with_start_wait(checked, wait):
+    """The check result with a start that did not finish as a failed degraded check (ln_start), so
+    the verdict is never protected for it."""
+    detail = start_wait_detail(wait)
+    if detail:
+        checked["checks"].append({"id": "ln_start", "class": "degraded", "result": "fail", "detail": detail})
+        checked["reasons"].append("ln_start")
+        if checked["verdict"] == "protected":
+            checked["verdict"] = "degraded"
+    return checked
+
+
 # ------------------------------------------------------------------------------------------
 # import
 # ------------------------------------------------------------------------------------------
@@ -1051,7 +1104,8 @@ def cmd_import(deps, args, result):
     cfg = parse_wg_config(data)
     result.fields.update({"valid": True, "warnings": cfg["warnings"], "public_key": cfg["public_key"],
                           "public_key_matches": cfg["public_key_matches"],
-                          "endpoint": {"host": cfg["endpoint_host"]}, "vpn_port": cfg["vpn_port"]})
+                          "endpoint": {"host": cfg["endpoint_host"]}, "vpn_port": cfg["vpn_port"],
+                          "ln_start_wait": None})
     state = load_state(deps)
     if state and state.get("public_key") != cfg["public_key"]:
         raise ModuleError("E_ALREADY_CONFIGURED", "refused",
@@ -1079,14 +1133,18 @@ def cmd_import(deps, args, result):
     with Lock(deps, wait=30):
         activate(deps, impl, result,
                  stored_writer=lambda: store_subscription(deps, cfg, "managed", impl, outcome, api_data))
-    finish_with_check(deps, result)
+    # the tool's install restarted a running unit: the check waits until that start is done
+    finish_with_check(deps, result, wait_until_started(deps, UNITS[impl]))
 
 
-def finish_with_check(deps, result):
-    checked = run_check(deps)
+def finish_with_check(deps, result, wait=None):
+    result.fields["ln_start_wait"] = wait
+    checked = with_start_wait(run_check(deps), wait)
     result.fields["verdict"] = checked["verdict"]
     result.fields["guard"] = checked["guard"]
     result.fields["check"] = {"reasons": checked["reasons"], "restart_needed": checked["restart_needed"]}
+    if start_wait_detail(wait):
+        result.fields["warnings"] = list(result.fields.get("warnings") or []) + [start_wait_detail(wait)]
     result.exit_code = verdict_exit(checked["verdict"])
 
 
@@ -2067,7 +2125,7 @@ def cmd_repair(deps, args, result):
         raise ModuleError("E_NOT_ELIGIBLE", "not_eligible", "no Lightning implementation to tunnel (%s)" % why,
                           EXIT_NOT_CONFIGURED)
     actions = []
-    result.fields["actions"] = actions
+    result.fields.update({"actions": actions, "ln_start_wait": None})
     with Lock(deps, wait=30):
         rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
         managed = ((tool or {}).get("install") or {}).get("kind") == "managed"
@@ -2117,8 +2175,14 @@ def cmd_repair(deps, args, result):
             actions.append("block" if rc == 0 else "block_failed")
             deps.run([ITS, "tick-timer", "on"], timeout=60)
             actions.append("tick_timer")
-    checked = run_check(deps)
+    # the reinstall restarted a running unit (the tool's install, or the start above): the check
+    # waits until that start is done; the path without a restart makes no wait
+    wait = wait_until_started(deps, unit) if "install" in actions else None
+    result.fields["ln_start_wait"] = wait
+    checked = with_start_wait(run_check(deps), wait)
     result.fields.update(checked)
+    if start_wait_detail(wait):
+        result.fields["warnings"] = list(result.fields.get("warnings") or []) + [start_wait_detail(wait)]
     result.exit_code = verdict_exit(checked["verdict"])
 
 

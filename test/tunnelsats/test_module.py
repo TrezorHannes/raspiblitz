@@ -75,6 +75,9 @@ class FakeSystem:
         self.hooks = []
         self.systemctl_rc = {}
         self.systemctl_noop = set()
+        # unit -> [reads, final]: a unit that is starting (Type=notify) reads back "activating" for that
+        # many ActiveState reads, then final; systemctl start or restart joins that start
+        self.starting = {}
         self.its = {
             "audit lnd": (0, {"status": "clean", "eligible": True, "keys": [], "reason": None,
                               "not_eligible_reason": None}),
@@ -147,10 +150,18 @@ class FakeSystem:
             if argv[1] == "show":
                 unit = argv[-1]
                 props = [argv[i + 1] for i in range(len(argv)) if argv[i] == "-p"]
+                if unit in self.starting and "ActiveState" in props:
+                    if self.starting[unit][0] > 0:
+                        self.starting[unit][0] -= 1
+                        self.units[unit]["ActiveState"] = "activating"
+                    else:
+                        self.units[unit]["ActiveState"] = self.starting.pop(unit)[1]
                 values = self.units.get(unit, {})
                 return 0, "".join("%s=%s\n" % (p, values.get(p, "")) for p in props), ""
             if self.systemctl_rc.get((argv[1], argv[-1])):
                 return self.systemctl_rc[(argv[1], argv[-1])], "", "Job for %s failed." % argv[-1]
+            if argv[1] in ("start", "restart") and argv[-1] in self.starting:
+                return 0, "", ""
             if self.stateful and argv[-1] in self.units and (argv[1], argv[-1]) not in self.systemctl_noop:
                 state = {"start": ("ActiveState", "active"), "restart": ("ActiveState", "active"),
                          "stop": ("ActiveState", "inactive"), "enable": ("UnitFileState", "enabled"),
@@ -293,6 +304,18 @@ class ModuleTestCase(unittest.TestCase):
         fake.its["uninstall"] = uninstall
         if still_managed:
             fake.its["detect"] = (0, fixture_json("tool", "detect_managed.json"))
+
+    def starts_after_install(self, reads, final="active", unit="lnd.service"):
+        """The tool's install --managed restarts unit, which stays activating (LND until it is ready,
+        Type=notify) for that many reads of its ActiveState, then reads back final."""
+        def hook(argv):
+            if argv[:2] == [mod.ITS, "install"]:
+                self.fake.units[unit]["ActiveState"] = "activating"
+                self.fake.starting[unit] = [reads, final]
+        self.fake.hooks.append(hook)
+
+    def start_steps(self):
+        return [s for s in self.fake.sleeps if s == mod.LN_START_STEP]
 
     def run_verb(self, *argv):
         out = io.StringIO()
@@ -671,6 +694,36 @@ class TestImport(ModuleTestCase):
         self.assertEqual((2, "E_CONFIG_NO_PORT"), (doc["exit_code"], doc["errors"][0]["code"]))
         doc = self.run_verb("import", "--file", self.path("missing.conf"))
         self.assertEqual((2, "E_FILE"), (doc["exit_code"], doc["errors"][0]["code"]))
+
+    # -- the check after the activation waits until the restarted Lightning unit has started --
+    def test_the_check_waits_until_lightning_has_started(self):
+        # the tool's install restarts LND, which stays activating until it is ready (Type=notify)
+        self.record()
+        self.starts_after_install(3)
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual((0, "protected"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "active", "waited_s": 9, "outcome": "active"},
+                         doc["ln_start_wait"])
+        self.assertEqual([mod.LN_START_STEP] * 3, self.start_steps())
+        self.assertNotIn("ln_start", doc["check"]["reasons"])
+
+    def test_a_start_that_does_not_finish_is_reported_never_passed(self):
+        self.record()
+        self.starts_after_install(1000)
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "activating", "waited_s": mod.LN_START_WAIT,
+                          "outcome": "timeout"}, doc["ln_start_wait"])
+        self.assertEqual(mod.LN_START_WAIT // mod.LN_START_STEP, len(self.start_steps()))
+        self.assertIn("ln_start", doc["check"]["reasons"])
+        self.assertIn("still starting after %d s" % mod.LN_START_WAIT, mod.result_text(doc) + json.dumps(doc))
+
+    def test_lightning_that_was_stopped_is_not_waited_for(self):
+        self.fake.units["lnd.service"]["ActiveState"] = "inactive"
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual({"unit": "lnd.service", "state": "inactive", "waited_s": 0, "outcome": "not_running"},
+                         doc["ln_start_wait"])
+        self.assertEqual([], self.start_steps())
 
 
 # ------------------------------------------------------------------------------------------
@@ -1756,6 +1809,47 @@ class TestRepair(ModuleTestCase):
         doc = self.run_verb("repair", "--yes")
         self.assertEqual(["block", "tick_timer"], doc["actions"])
         self.assertEqual(-1, self.fake.index_of(mod.ITS, "uninstall"))
+        # nothing restarted Lightning: no wait before the check
+        self.assertEqual((None, []), (doc["ln_start_wait"], self.fake.sleeps))
+
+    # -- the check after the reinstall waits until the restarted Lightning unit has started --
+    def reinstall(self, reads, final="active"):
+        """REPAIR on a node without the managed install: it activates again, and the tool's install
+        restarts LND, which then stays activating for that many reads of its state."""
+        self.store()
+        self.activate_conf()
+        self.record()
+        self.starts_after_install(reads, final)
+        return self.run_verb("repair", "--yes")
+
+    def test_the_check_waits_until_lightning_has_started(self):
+        doc = self.reinstall(3)
+        self.assertEqual((0, "protected", ["install", "start"]), (doc["exit_code"], doc["verdict"], doc["actions"]), doc)
+        # one read by REPAIR's own start step, then the wait: two more starting reads, then active
+        self.assertEqual({"unit": "lnd.service", "state": "active", "waited_s": 6, "outcome": "active"},
+                         doc["ln_start_wait"])
+        self.assertEqual([mod.LN_START_STEP] * 2, self.start_steps())
+        self.assertNotIn("ln_start", doc["reasons"])
+
+    def test_a_start_that_does_not_finish_is_reported_never_passed(self):
+        doc = self.reinstall(1000)
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "activating", "waited_s": mod.LN_START_WAIT,
+                          "outcome": "timeout"}, doc["ln_start_wait"])
+        check = [c for c in doc["checks"] if c["id"] == "ln_start"]
+        self.assertEqual([("degraded", "fail")], [(c["class"], c["result"]) for c in check])
+        self.assertIn("still starting after %d s" % mod.LN_START_WAIT, check[0]["detail"])
+        self.assertIn("ln_start", doc["reasons"])
+        self.assertIn(check[0]["detail"], doc["warnings"])
+
+    def test_a_unit_that_fails_while_starting_is_reported(self):
+        doc = self.reinstall(2, "failed")
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "failed", "waited_s": 3, "outcome": "failed"},
+                         doc["ln_start_wait"])
+        check = [c for c in doc["checks"] if c["id"] == "ln_start"]
+        self.assertIn("stopped while starting (failed)", check[0]["detail"])
+        self.assertIn("ln_start", doc["reasons"])
 
     def test_refusals(self):
         self.assertEqual(3, self.run_verb("repair", "--yes")["exit_code"])
