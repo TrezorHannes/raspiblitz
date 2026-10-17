@@ -103,6 +103,9 @@ RESTARTABLE = ("emergency_block", "verify_timeout", "verify_unsafe", "verify_fai
                "verify_inconsistent", "not_installed", "tool_missing", "unit_mismatch", "announce_unconfirmed")
 RESTART_MESSAGE = ("TunnelSats: the tunnel is ready again. Restart Lightning to resume clearnet connections "
                    "(SSH menu > SUBSCRIBE > TunnelSats).")
+# announce_cleanup of the tool's uninstall --managed (contract 1, additive since tunnelsats PR 230): its
+# own step that takes the former VPN address out of LND's node announcement
+TOOL_ANNOUNCE_RESULTS = ("removed", "none", "lnd_not_ready", "failed", "skipped")
 
 # Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
 KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
@@ -1713,7 +1716,8 @@ def cmd_uninstall(deps, args, result):
     conf = read_rb_conf(deps)
     result.fields.update({"removed": False, "remaining": [], "ln_was_active": False, "ln_started": False,
                           "ln_reenabled": False, "node_config": None, "block": None, "purged": False,
-                          "artifacts": [], "announce_cleanup": None})
+                          "artifacts": [], "announce_cleanup": None, "tool_announce_cleanup": None,
+                          "tool_warnings": []})
     if state and state.get("mode") == "adopted_legacy":
         with Lock(deps, wait=30):
             purge(deps)
@@ -1755,6 +1759,11 @@ def cmd_uninstall(deps, args, result):
                            ln_disabled=bool(doc.get("ln_disabled")) or pending["ln_disabled"])
             result.fields.update({"remaining": doc["remaining"], "ln_was_active": bool(doc.get("ln_was_active")),
                                   "ln_started": bool(doc.get("ln_started")), "node_config": doc.get("node_config")})
+            # the tool's own step for LND's node announcement, for the record: REMOVE checks the
+            # announcement again itself below, and only that step decides what REMOVE reports and warns
+            if doc.get("announce_cleanup") in TOOL_ANNOUNCE_RESULTS:
+                result.fields["tool_announce_cleanup"] = doc["announce_cleanup"]
+            result.fields["tool_warnings"] = [w for w in doc.get("warnings") or [] if isinstance(w, str)][:10]
         else:
             # a REMOVE refused earlier (config not Tor-only at rest) kept this unit stopped: this run
             # audits it again and enables and starts it only if the config is Tor-only now
@@ -1763,9 +1772,13 @@ def cmd_uninstall(deps, args, result):
                 doc = pending
                 unit = pending["unit"]
                 result.fields["ln_was_active"] = pending["ln_was_active"]
-        # uninstall --managed leaves the unit stopped and disabled when it cannot prove the node
-        # config clean (on RaspiBlitz always: ExecStart takes $TUNNELSATS_*_ARGS). Only this REMOVE's
-        # own audit of exactly that unit's implementation may undo it; the other one is checked too.
+        # uninstall --managed starts the unit again itself when it finds the node config clean (since
+        # tunnelsats PR 227 also with the start guard's variable in ExecStart: the env file this REMOVE
+        # deleted counts like an empty one). It leaves the unit stopped, and disabled, when the config
+        # holds TunnelSats settings or cannot be checked, and it never starts a unit that was not running
+        # when it began, such as one an earlier REMOVE left stopped (remove_pending). Then, and when the
+        # report was lost, only this REMOVE's own audit of exactly that unit's implementation may enable
+        # and start it; the other one is checked too.
         unit_impl = IMPL_OF_UNIT.get(unit) if unit else None
         main_ok = other_ok = True
         main_doc = other_doc = None

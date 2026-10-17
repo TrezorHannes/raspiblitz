@@ -830,6 +830,56 @@ class TestRemove(ModuleTestCase):
         self.assertEqual((0, "clean", True), (doc["exit_code"], doc["at_rest"], doc["removed"]), doc)
         self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
 
+    # -- uninstall --managed of the pinned tool: it reads the start guard's variable through -----
+    def tool_restarts_lnd(self):
+        """REMOVE deleted the guard's env file, so the pinned tool finds lnd.conf clean: it starts LND
+        again itself (outside the slice, Tor-only), never disables the unit, and takes the former VPN
+        address out of LND's node announcement."""
+        self.fake.its["uninstall"] = (0, fixture_json("tool", "uninstall_clean.json"))
+        self.fake.its["audit lnd --repair"] = (1, self.audit("not_checked"))
+
+    def test_the_tool_starts_lnd_again_and_remove_does_not_enable_or_start_it(self):
+        self.tool_restarts_lnd()
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, "clean", "clean"), (doc["exit_code"], doc["removed"], doc["node_config"], doc["at_rest"]), doc)
+        self.assertEqual({"ln_was_active": True, "ln_started": True, "ln_reenabled": False},
+                         {key: doc[key] for key in ("ln_was_active", "ln_started", "ln_reenabled")})
+        self.assertEqual([], self.fake.calls_of("systemctl", "enable") + self.fake.calls_of("systemctl", "start"))
+        self.assertEqual("removed", doc["tool_announce_cleanup"])
+        self.assertNotIn("remove_pending", mod.load_state(self.deps))
+
+    def test_an_address_the_tool_took_out_already_leaves_announce_cleanup_none(self):
+        # REMOVE still checks LND's announcement itself (defence in depth) and finds nothing left
+        self.tool_restarts_lnd()
+        self.record(ipv4="1.2.3.4")
+        self.fake.getinfo["uris"] = ["0280a@exampleonion.onion:9735"]
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, "none", "removed", []),
+                         (doc["exit_code"], doc["removed"], doc["announce_cleanup"], doc["tool_announce_cleanup"],
+                          doc["warnings"]), doc)
+        self.assertEqual([], doc["errors"])
+        self.assertEqual([], [c for c in self.fake.calls if "updatenodeannouncement" in c])
+
+    def test_the_tools_announcement_result_and_warnings_are_kept_apart_from_removes_own(self):
+        # the tool kept LND stopped (TunnelSats settings in lnd.conf) and named the command; REMOVE's
+        # own audit repaired the config, started LND and took the address out itself
+        self.record(ipv4="1.2.3.4")
+        doc = self.run_verb("uninstall", "--yes")
+        tool = fixture_json("tool", "uninstall_disabled.json")
+        self.assertEqual((0, "removed", "skipped"), (doc["exit_code"], doc["announce_cleanup"], doc["tool_announce_cleanup"]), doc)
+        self.assertEqual(tool["warnings"], doc["tool_warnings"])
+        self.assertEqual([], doc["warnings"])
+        self.assertNotIn("does not run", mod.result_text(doc))
+
+    def test_a_tool_without_the_announcement_fields_leaves_them_empty(self):
+        # a report without announce_cleanup and warnings (as tools before tunnelsats PR 230 wrote it)
+        uninstall = fixture_json("tool", "uninstall_disabled.json")
+        for key in ("announce_cleanup", "warnings"):
+            del uninstall[key]
+        self.fake.its["uninstall"] = (0, uninstall)
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, True, None, []), (doc["exit_code"], doc["removed"], doc["tool_announce_cleanup"], doc["tool_warnings"]), doc)
+
     def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
         self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))
@@ -1005,6 +1055,7 @@ class TestRemove(ModuleTestCase):
                         < f.calls.index(["systemctl", "start", "lnd.service"]))
         self.assertEqual({"ActiveState": "active", "UnitFileState": "enabled"}, self.lnd_state())
         self.assertIn("E_TOOL_OUTPUT", doc["warnings"][0])
+        self.assertEqual((None, []), (doc["tool_announce_cleanup"], doc["tool_warnings"]))
         self.assertNotIn("remove_pending", mod.load_state(self.deps))
 
     def test_a_lost_report_and_a_config_not_tor_only_keep_lightning_stopped_for_remove_again(self):
