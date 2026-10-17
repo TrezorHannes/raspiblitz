@@ -194,7 +194,7 @@ while True:
     [ "$(call its_dev_override_sha)" = "$h" ]
 }
 
-@test "fetch, install, uninstall, verify, detect need root" {
+@test "fetch, install, adopt, uninstall, verify, detect need root" {
     TS_RB_ROOT_UID=99999
     local verb
     for verb in its_cmd_fetch its_cmd_uninstall its_cmd_verify its_cmd_detect; do
@@ -203,6 +203,8 @@ while True:
         [ "$(jq -r '.errors[0].code' <<< "$output")" = E_NOT_ROOT ]
     done
     run --separate-stderr call its_cmd_install --impl lnd --json
+    [ "$status" -eq 2 ]
+    run --separate-stderr call its_cmd_adopt --impl lnd --json
     [ "$status" -eq 2 ]
 }
 
@@ -230,6 +232,21 @@ while True:
     chmod 0644 "$CONF"
     run --separate-stderr call its_cmd_install --impl lnd --json
     [ "$status" -eq 3 ]
+}
+
+@test "adopt: needs the stored config; runs the stored copy with adopt --managed raspiblitz; cl becomes cln" {
+    dist_stub
+    answer adopt tool/install_ok.json
+    run --separate-stderr call its_cmd_adopt --impl lnd --json
+    [ "$status" -eq 3 ]
+    [ "$(jq -r '.errors[0].code' <<< "$output")" = E_NOT_CONFIGURED ]
+    stored_conf
+    run --separate-stderr call its_cmd_adopt --impl lnd --json
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(cat "${FIXTURES}/tool/install_ok.json")" ]
+    [ "$(tail -n 1 "$FX/dist.calls")" = "adopt --managed raspiblitz --impl lnd --network mainnet --config ${CONF} --non-interactive --yes --json" ]
+    run --separate-stderr call its_cmd_adopt --impl cl --json
+    [ "$(tail -n 1 "$FX/dist.calls")" = "adopt --managed raspiblitz --impl cln --network mainnet --config ${CONF} --non-interactive --yes --json" ]
 }
 
 @test "pass-through: contract 2 becomes E_CONTRACT, no document becomes E_TOOL_OUTPUT, env is clean" {

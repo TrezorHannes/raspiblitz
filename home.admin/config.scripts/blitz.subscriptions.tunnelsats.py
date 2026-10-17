@@ -86,6 +86,7 @@ ITS_TIMEOUT = {
     "fetch": 300,            # its_fetch_online: TS_RB_FETCH_BUDGET (240) for all network steps
     "detect": 420,           # a fetch when no copy is stored, then the tool's detect (120, +10 kill)
     "install": 960,          # the tool's install --managed (900, +10 kill)
+    "adopt": 960,            # the tool's adopt --managed (900, +10 kill)
     "uninstall": 660,        # the tool's uninstall --managed (600, +10 kill)
     "verify": 150,           # the tool's verify with probes (120, +10 kill)
     "verify_no_probe": 60,   # the tool's verify --no-probe (35, +10 kill)
@@ -115,6 +116,11 @@ ADDRESS_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b")
 # degraded): at most LN_START_WAIT seconds, read every LN_START_STEP seconds
 LN_START_WAIT = 90
 LN_START_STEP = 3
+# When the final check of IMPORT, ADOPT --upgrade or REPAIR finds wg_handshake ("no handshake yet")
+# as the only failing check, it waits briefly for the handshake the probe or Lightning traffic
+# initiated: at most HANDSHAKE_WAIT seconds, read every HANDSHAKE_STEP seconds
+HANDSHAKE_WAIT = 15
+HANDSHAKE_STEP = 3
 # the drop-in with which install --managed puts the managed unit into the slice, as detect reports it
 # (artifact managed_ln_dropin)
 DROPIN_RE = re.compile(r"/etc/systemd/system/([A-Za-z0-9_.@-]+\.service)\.d/tunnelsats-managed\.conf")
@@ -945,9 +951,9 @@ def tool_error(doc, fallback):
     return code if isinstance(code, str) and re.fullmatch(r"E_[A-Z0-9_]{1,40}", code) else fallback
 
 
-def activate(deps, impl, result, stored_writer=None):
-    """Design 6.3: preflight without changes, store, unit, flags, install, block, timer, check."""
-    activation = {"fetch": None, "unit_regenerated": False, "install": None, "ln_restarted": None,
+def activate(deps, impl, result, stored_writer=None, tool_verb="install"):
+    """Design 6.3: preflight without changes, store, unit, flags, install/adopt, block, timer, check."""
+    activation = {"fetch": None, "unit_regenerated": False, tool_verb: None, "ln_restarted": None,
                   "restore_block": None, "tick_timer": None}
     result.fields["activation"] = activation
     rc, doc = its(deps, ["fetch", "--json"], timeout=ITS_TIMEOUT["fetch"])
@@ -962,25 +968,58 @@ def activate(deps, impl, result, stored_writer=None):
     template_ok = unit_template_ok(deps, impl)
     if stored_writer:
         stored_writer()
-    if not template_ok:
+    if tool_verb == "install" and not template_ok:
         regenerate_unit(deps, impl)
         activation["unit_regenerated"] = True
     blitz_conf_set(deps, "tunnelsatsImpl", impl)
     blitz_conf_set(deps, "tunnelsats", "on")
-    rc, doc = its(deps, ["install", "--impl", impl, "--json"], timeout=ITS_TIMEOUT["install"])
+    rc, doc = its(deps, [tool_verb, "--impl", impl, "--json"], timeout=ITS_TIMEOUT[tool_verb])
+    if rc != 0 and tool_verb == "adopt" and doc and doc.get("adopted"):
+        # E_PARTIAL: the managed dataplane is installed and armed, only the Lightning unit or the
+        # verifier timer did not start; finish as managed and let the final check report it
+        result.fields["warnings"] = list(result.fields.get("warnings") or []) + [tool_error(doc, "E_PARTIAL")]
+        rc = 0
     if rc != 0:
+        fallback = "E_ADOPT_FAILED" if tool_verb == "adopt" else "E_INSTALL_FAILED"
+        activation[tool_verb] = tool_error(doc, fallback)
+        if tool_verb == "adopt":
+            # adopt stops Lightning before it removes the legacy setup. Unless the unit still runs (adopt
+            # refused before any change), the legacy clearnet settings may be left without a tunnel:
+            # keep tunnelsats on, so the start guard keeps Lightning Tor-only, and repair them at rest
+            _rc, audit = its(deps, ["audit", impl, "--repair", "--json"], timeout=30)
+            if tool_error(audit, "") != "E_UNIT_ACTIVE":
+                raise ModuleError(activation[tool_verb], "operational",
+                                  "the legacy setup could not be replaced; Lightning stays stopped, and TunnelSats "
+                                  "stays on so its next start is Tor-only (fix the cause, then run ADOPT --upgrade "
+                                  "again)", map_tool_exit(rc))
+            blitz_conf_set(deps, "tunnelsats", "off")
+            raise ModuleError(activation[tool_verb], "operational",
+                              "adopt refused before any change; the legacy setup keeps running (fix the cause, "
+                              "then run ADOPT --upgrade again)", map_tool_exit(rc))
         blitz_conf_set(deps, "tunnelsats", "off")
-        activation["install"] = tool_error(doc, "E_INSTALL_FAILED")
-        raise ModuleError(activation["install"], "operational",
+        raise ModuleError(activation[tool_verb], "operational",
                           "the managed dataplane could not be installed; Lightning stays Tor-only "
                           "(the stored config stays for REPAIR)", map_tool_exit(rc))
-    activation["install"] = "ok"
+    activation[tool_verb] = "ok"
     activation["ln_restarted"] = bool(doc.get("ln_restarted")) if doc else None
-    rc, doc = its(deps, ["block-insert", "--json"], timeout=30)
+    if tool_verb == "adopt":
+        for key in ("legacy_kind", "legacy_removed", "legacy_remaining", "unit_edits", "unit_reverted"):
+            if doc and key in doc:
+                activation[key] = doc[key]
+        if not activation["ln_restarted"]:
+            its(deps, ["audit", impl, "--repair", "--json"], timeout=30)
+        if not unit_template_ok(deps, impl):
+            regenerate_unit(deps, impl)
+            activation["unit_regenerated"] = True
+            if doc and (doc.get("ln_restarted") or doc.get("ln_was_active")):
+                systemctl(deps, "restart", UNITS[impl])
+                activation["ln_restarted"] = True
+    rc, block_doc = its(deps, ["block-insert", "--json"], timeout=30)
     activation["restore_block"] = "present" if rc == 0 else "failed"
     rc, out, _err = deps.run([ITS, "tick-timer", "on"], timeout=60)
     activation["tick_timer"] = "active" if rc == 0 else "failed"
     wait_for_handshake(deps)
+    return doc
 
 
 def wait_for_handshake(deps, seconds=60, step=5):
@@ -1048,6 +1087,27 @@ def with_start_wait(checked, wait):
         checked["reasons"].append("ln_start")
         if checked["verdict"] == "protected":
             checked["verdict"] = "degraded"
+    return checked
+
+
+def only_no_handshake_yet(checked):
+    """True when the only failing check in checked is wg_handshake with 'no handshake yet'."""
+    failed = [c for c in checked.get("checks") or [] if c.get("result") == "fail"]
+    return (len(failed) == 1 and failed[0].get("id") == "wg_handshake"
+            and "no handshake yet" in str(failed[0].get("detail") or "").lower())
+
+
+def check_after_activation(deps, wait=None, limit=HANDSHAKE_WAIT, step=HANDSHAKE_STEP):
+    """The final check after an activation or reinstall (IMPORT, ADOPT --upgrade, REPAIR): when the
+    only failing check is wg_handshake ("no handshake yet"), waits briefly (at most limit seconds,
+    every step seconds) and runs the check again so the first handshake initiated by the probe or
+    Lightning traffic is seen without turning any other check into protected."""
+    checked = with_start_wait(run_check(deps), wait)
+    started, waited = deps.clock(), 0
+    while only_no_handshake_yet(checked) and waited < limit and (deps.clock() - started).total_seconds() < limit:
+        deps.sleep(step)
+        waited += step
+        checked = with_start_wait(run_check(deps), wait)
     return checked
 
 
@@ -1121,8 +1181,8 @@ def cmd_import(deps, args, result):
                           "another subscription is stored on this node: REMOVE it first", EXIT_REFUSED)
     if state and state.get("mode") == "adopted_legacy":
         raise ModuleError("E_UPGRADE_UNAVAILABLE", "refused",
-                          "this subscription runs on the adopted standard install; UPGRADE comes with a later "
-                          "TunnelSats release", EXIT_REFUSED)
+                          "this subscription runs on the adopted standard install: run adopt --upgrade --yes",
+                          EXIT_REFUSED)
     found = detect(deps, args.impl)
     result.fields["detect"] = {"eligible": found["eligible"], "reasons": found["reasons"]}
     if found["reasons"]:
@@ -1148,7 +1208,7 @@ def cmd_import(deps, args, result):
 
 def finish_with_check(deps, result, wait=None):
     result.fields["ln_start_wait"] = wait
-    checked = with_start_wait(run_check(deps), wait)
+    checked = check_after_activation(deps, wait)
     result.fields["verdict"] = checked["verdict"]
     result.fields["guard"] = checked["guard"]
     result.fields["check"] = {"reasons": checked["reasons"], "restart_needed": checked["restart_needed"]}
@@ -1162,7 +1222,7 @@ def verdict_exit(verdict):
 
 
 # ------------------------------------------------------------------------------------------
-# adopt (step 1: take over the subscription of a standard install, no system change)
+# adopt (step 1: take over the subscription of a standard install; step 2: --upgrade to managed)
 # ------------------------------------------------------------------------------------------
 
 def custom_installs_lines(deps):
@@ -1188,21 +1248,7 @@ def custom_installs_lines(deps):
     return found
 
 
-def cmd_adopt(deps, args, result):
-    result.fields.update({"adopted": False, "upgrade_available": False,
-                          "upgrade_requires": "tunnelsats.sh adopt --managed (PR-T2)"})
-    if args.upgrade:
-        raise ModuleError("E_UPGRADE_UNAVAILABLE", "refused",
-                          "UPGRADE to managed mode comes with a later TunnelSats release", EXIT_REFUSED)
-    rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
-    if tool is None or rc != 0:
-        raise ModuleError("E_DETECT_FAILED", "operational", "the TunnelSats install could not be detected",
-                          EXIT_OPERATIONAL)
-    kind = (tool.get("install") or {}).get("kind")
-    if kind == "none":
-        raise ModuleError("E_NOTHING_TO_ADOPT", "not_configured", "no TunnelSats install found", EXIT_NOT_CONFIGURED)
-    if kind == "managed":
-        raise ModuleError("E_ALREADY_MANAGED", "refused", "TunnelSats already runs in managed mode", EXIT_REFUSED)
+def read_legacy_config(deps, tool):
     path = (tool.get("config") or {}).get("path")
     if not isinstance(path, str) or not LEGACY_CONF_RE.fullmatch(path):
         raise ModuleError("E_CONFIG_NOT_FOUND", "operational", "the legacy WireGuard config was not found",
@@ -1213,19 +1259,64 @@ def cmd_adopt(deps, args, result):
     except OSError:
         raise ModuleError("E_CONFIG_NOT_FOUND", "operational", "the legacy WireGuard config cannot be read",
                           EXIT_OPERATIONAL) from None
-    cfg = parse_wg_config(data)
+    return parse_wg_config(data)
+
+
+def cmd_adopt(deps, args, result):
+    if args.upgrade and not args.yes:
+        raise ModuleError("E_CONFIRMATION_REQUIRED", "usage",
+                          "ADOPT --upgrade needs --yes (it replaces the legacy setup and restarts Lightning)",
+                          EXIT_USAGE)
+    result.fields.update({"adopted": False, "upgraded": False, "upgrade_available": True})
+    rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
+    if tool is None or rc != 0:
+        raise ModuleError("E_DETECT_FAILED", "operational", "the TunnelSats install could not be detected",
+                          EXIT_OPERATIONAL)
+    kind = (tool.get("install") or {}).get("kind")
+    if kind == "none":
+        raise ModuleError("E_NOTHING_TO_ADOPT", "not_configured", "no TunnelSats install found", EXIT_NOT_CONFIGURED)
+    if kind == "managed":
+        raise ModuleError("E_ALREADY_MANAGED", "refused", "TunnelSats already runs in managed mode", EXIT_REFUSED)
     state = load_state(deps)
-    if state and state.get("public_key") != cfg["public_key"]:
-        raise ModuleError("E_ALREADY_CONFIGURED", "refused",
-                          "another subscription is stored on this node: REMOVE it first", EXIT_REFUSED)
-    result.fields.update({"public_key": cfg["public_key"], "legacy_kind": kind, "warnings": cfg["warnings"]})
-    outcome, data_api = confirm_with_api(deps, cfg, args.yes, result)
+    if args.upgrade and state and state.get("mode") == "adopted_legacy":
+        cfg = load_stored_config(deps)
+        if cfg is None or cfg["public_key"] != state.get("public_key"):
+            raise ModuleError("E_STORED_CONFIG", "operational",
+                              "the stored config is missing or invalid: run ADOPT again", EXIT_OPERATIONAL)
+        api = state.get("api") or {}
+        outcome, data_api = api.get("outcome") or "skipped", api.get("data")
+        result.fields.update(sync_fields(outcome, data_api, cfg))
+    else:
+        cfg = read_legacy_config(deps, tool)
+        if state and state.get("public_key") != cfg["public_key"]:
+            raise ModuleError("E_ALREADY_CONFIGURED", "refused",
+                              "another subscription is stored on this node: REMOVE it first", EXIT_REFUSED)
+        outcome, data_api = confirm_with_api(deps, cfg, args.yes, result)
+    result.fields.update({"public_key": cfg["public_key"], "legacy_kind": kind, "warnings": list(cfg["warnings"])})
     conf = read_rb_conf(deps)
     impl, _why = select_impl(conf)
+    if not args.upgrade:
+        with Lock(deps, wait=30):
+            store_subscription(deps, cfg, "adopted_legacy", impl, outcome, data_api, {"legacy_kind": kind})
+        result.fields["adopted"] = True
+        result.fields["custom_installs_lines"] = custom_installs_lines(deps)
+        return
+    result.fields["ln_start_wait"] = None
+    found = detect(deps)
+    reasons = [r for r in found["reasons"] if r not in ("legacy_install", "unknown_install")]
+    result.fields["detect"] = {"eligible": not reasons, "reasons": reasons}
+    if reasons:
+        raise ModuleError("E_NOT_ELIGIBLE", "not_eligible", "not eligible: %s" % ", ".join(reasons),
+                          EXIT_NOT_CONFIGURED)
+    impl = found["impl"]
     with Lock(deps, wait=30):
+        # Store as adopted_legacy first so if adopt --managed fails, the subscription stays stored
         store_subscription(deps, cfg, "adopted_legacy", impl, outcome, data_api, {"legacy_kind": kind})
-    result.fields["adopted"] = True
-    result.fields["custom_installs_lines"] = custom_installs_lines(deps)
+        activate(deps, impl, result, tool_verb="adopt")
+        store_subscription(deps, cfg, "managed", impl, outcome, data_api, {"legacy_kind": kind})
+    result.fields.update({"adopted": True, "upgraded": True, "upgrade_available": False,
+                          "custom_installs_lines": custom_installs_lines(deps)})
+    finish_with_check(deps, result, wait_until_started(deps, UNITS[impl]))
 
 
 # ------------------------------------------------------------------------------------------
@@ -1426,7 +1517,7 @@ def run_check(deps):
                 "clearnet_blocked": None, "guard": {}, "restart_needed": False}
     if state.get("mode") == "adopted_legacy":
         add("legacy_lifecycle", "unsafe", "fail", "legacy setup: the kill switch depends on the tunnel being up "
-            "(UPGRADE to managed mode comes with a later TunnelSats release)")
+            "(UPGRADE to managed mode in the menu, or run adopt --upgrade --yes)")
         return {"verdict": "unsafe", "reasons": ["legacy_lifecycle"], "checks": checks, "clearnet_blocked": None,
                 "guard": {}, "restart_needed": False}
     impl = state.get("impl") or conf.get("tunnelsatsImpl")
@@ -2141,7 +2232,8 @@ def cmd_repair(deps, args, result):
                           EXIT_NOT_CONFIGURED)
     if state.get("mode") == "adopted_legacy":
         raise ModuleError("E_UPGRADE_UNAVAILABLE", "refused",
-                          "the adopted standard install can be upgraded with a later TunnelSats release", EXIT_REFUSED)
+                          "the adopted standard install is not in managed mode yet: run adopt --upgrade --yes",
+                          EXIT_REFUSED)
     cfg = load_stored_config(deps)
     if cfg is None or cfg["public_key"] != state.get("public_key"):
         raise ModuleError("E_STORED_CONFIG", "operational", "the stored config is missing or invalid: IMPORT again",
@@ -2211,7 +2303,7 @@ def cmd_repair(deps, args, result):
     # waits until that start is done; the path without a restart makes no wait
     wait = wait_until_started(deps, unit) if "install" in actions else None
     result.fields["ln_start_wait"] = wait
-    checked = with_start_wait(run_check(deps), wait)
+    checked = check_after_activation(deps, wait) if "install" in actions else with_start_wait(run_check(deps), wait)
     result.fields.update(checked)
     if start_wait_detail(wait):
         result.fields["warnings"] = list(result.fields.get("warnings") or []) + [start_wait_detail(wait)]
@@ -2370,6 +2462,8 @@ def menu_choices(deps, state, conf, found=None):
         remove = ("REMOVE", "Remove again: check the config, then start Lightning")
     choices = [("STATUS", "Subscription and tunnel status"), ("CHECK", "Connection check"),
                ("REPAIR", "Re-apply TunnelSats (also: update the pinned tool)"), remove]
+    if state.get("mode") == "adopted_legacy":
+        choices.insert(2, ("UPGRADE", "Upgrade the adopted setup to managed mode"))
     if active_ts and state.get("mode") != "adopted_legacy" and impl in UNITS:
         if unit_props(deps, UNITS[impl], "ActiveState")["ActiveState"] != "active":
             choices.append(("START", "Start Lightning"))
@@ -2485,6 +2579,15 @@ def cmd_menu(deps, args, result):  # pragma: no cover - interactive
                 continue
             doc = menu_run(deps, ["adopt"])
             d.msgbox(result_text(doc), title="ADOPT", width=78, height=20)
+        elif tag == "UPGRADE":
+            if d.yesno("UPGRADE converts the adopted setup to managed mode (start guard, kill switch, "
+                       "restore after updates) and may restart Lightning. Continue?",
+                       width=70, height=10, title="UPGRADE") != d.OK:
+                continue
+            os.system("clear")
+            print("# TunnelSats: upgrading to managed mode, this can take a few minutes ...")
+            doc = menu_run(deps, ["adopt", "--upgrade", "--yes"])
+            d.msgbox(result_text(doc), title="UPGRADE", width=78, height=20)
         elif tag == "STATUS":
             doc = menu_run(deps, ["status", "--refresh"])
             d.msgbox(status_text(doc), title="STATUS", width=78, height=22)
