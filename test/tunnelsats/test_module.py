@@ -91,7 +91,7 @@ class FakeSystem:
             "block-remove": (0, {"state": "absent", "changed": True}),
             "block-status": (0, {"state": "present"}),
             "install": (0, fixture_json("tool", "install_ok.json")),
-            "adopt": (0, fixture_json("tool", "install_ok.json")),
+            "adopt": (0, dict(fixture_json("tool", "install_ok.json"), adopted=True)),
             "uninstall": (0, fixture_json("tool", "uninstall_disabled.json")),
             "verify --no-probe": (5, fixture_json("verify", "activating_tunnel_up.json")),
             "verify": (0, fixture_json("verify", "protected.json")),
