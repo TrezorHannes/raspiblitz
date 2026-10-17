@@ -1709,14 +1709,48 @@ def clear_pending_removal(deps):
         save_state(deps, state)
 
 
+def stop_unless_tor_only(deps, unit):
+    """REMOVE, before uninstall --managed. Since tunnelsats PR 227 the tool starts the unit it stopped
+    again itself when its own check of the node config finds no TunnelSats clearnet settings. That
+    check is narrower than the at-rest audit (for LND it leaves out externalip, an empty externalhosts
+    and tor.active, for CLN a missing always-use-proxy=true), with TunnelSats off the start guard
+    repairs nothing at that start, and the audit repairs only a stopped unit. A running unit whose
+    config the audit does not find Tor-only at rest, or cannot check, is therefore stopped here while
+    the dataplane still holds, recorded as remove_pending before the stop, and disabled if it was
+    enabled. The tool then neither stops nor starts it, and this REMOVE repairs the config and enables
+    and starts the unit after its own audit, or keeps it stopped and disabled, as after a refused
+    REMOVE. Returns (record or None, outcome), outcome "skipped", "stopped" or "stop_failed"."""
+    impl = IMPL_OF_UNIT.get(unit) if unit else None
+    if impl is None:
+        return None, "skipped"
+    props = unit_props(deps, unit, "ActiveState", "UnitFileState")
+    if props["ActiveState"] in ("inactive", "failed"):
+        return None, "skipped"
+    if at_rest_ok(at_rest_audit(deps, impl, repair=False)):
+        return None, "skipped"
+    record = {"unit": unit, "ln_was_active": True, "ln_disabled": False, "ln_started": False}
+    keep_pending_removal(deps, unit, record)
+    if not systemctl(deps, "stop", unit) or \
+            unit_props(deps, unit, "ActiveState")["ActiveState"] not in ("inactive", "failed"):
+        return record, "stop_failed"
+    if props["UnitFileState"] in ("enabled", "enabled-runtime"):
+        # recorded before the disable: a REMOVE that ends here leaves the next one to enable it again
+        record["ln_disabled"] = True
+        keep_pending_removal(deps, unit, record)
+        if not systemctl(deps, "disable", unit):
+            record["ln_disabled"] = False
+            keep_pending_removal(deps, unit, record)
+    return record, "stopped"
+
+
 def cmd_uninstall(deps, args, result):
     if not args.yes:
         raise ModuleError("E_CONFIRMATION_REQUIRED", "usage", "REMOVE needs --yes", EXIT_USAGE)
     state = load_state(deps)
     conf = read_rb_conf(deps)
     result.fields.update({"removed": False, "remaining": [], "ln_was_active": False, "ln_started": False,
-                          "ln_reenabled": False, "node_config": None, "block": None, "purged": False,
-                          "artifacts": [], "announce_cleanup": None, "tool_announce_cleanup": None,
+                          "ln_reenabled": False, "ln_stopped_first": False, "node_config": None, "block": None,
+                          "purged": False, "artifacts": [], "announce_cleanup": None, "tool_announce_cleanup": None,
                           "tool_warnings": []})
     if state and state.get("mode") == "adopted_legacy":
         with Lock(deps, wait=30):
@@ -1750,6 +1784,17 @@ def cmd_uninstall(deps, args, result):
         if managed:
             # an earlier REMOVE that did not finish may have stopped the unit (read while it is stopped)
             pending = pending_removal(deps, state)
+            if pending is None:
+                pending, outcome = stop_unless_tor_only(deps, unit)
+                result.fields["ln_stopped_first"] = outcome == "stopped"
+                if outcome == "stop_failed":
+                    # the tool would stop the unit and start it again with that config, so it is not run
+                    result.fields.update({"remaining": ["managed dataplane"], "ln_was_active": True})
+                    result.error("E_LN_STOP", "operational",
+                                 "%s did not stop, so the TunnelSats uninstall did not run: it would start it "
+                                 "again with a config that is not Tor-only at rest. Lightning keeps running in "
+                                 "the tunnel; run REMOVE again" % unit, EXIT_OPERATIONAL)
+                    return
             doc, note = tool_uninstall(deps, unit)
             if note:
                 notes.append(note)
@@ -1776,9 +1821,10 @@ def cmd_uninstall(deps, args, result):
         # tunnelsats PR 227 also with the start guard's variable in ExecStart: the env file this REMOVE
         # deleted counts like an empty one). It leaves the unit stopped, and disabled, when the config
         # holds TunnelSats settings or cannot be checked, and it never starts a unit that was not running
-        # when it began, such as one an earlier REMOVE left stopped (remove_pending). Then, and when the
-        # report was lost, only this REMOVE's own audit of exactly that unit's implementation may enable
-        # and start it; the other one is checked too.
+        # when it began, such as one an earlier REMOVE left stopped (remove_pending) or one this REMOVE
+        # stopped first (stop_unless_tor_only). Then, and when the report was lost, only this REMOVE's
+        # own audit of exactly that unit's implementation may enable and start it; the other one is
+        # checked too.
         unit_impl = IMPL_OF_UNIT.get(unit) if unit else None
         main_ok = other_ok = True
         main_doc = other_doc = None
