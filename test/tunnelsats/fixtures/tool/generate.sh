@@ -74,3 +74,14 @@ TS_M_FILES=() TS_M_FILE_SHA=() TS_M_CREATED_DIRS=() TS_M_ENABLED_UNITS=()
 ts_m_inventory_write'
 printf '%s\n' "$WG_CONF" > "$fx/fs/etc/wireguard/tunnelsatsv2.conf"
 gen detect_managed
+
+# A managed install of CLN with the drop-in that puts lightningd.service into the slice
+# (managed_ln_dropin present: REMOVE takes the managed unit from it)
+fx=$(new_fixture detect-managed-cln)
+mkdir -p "$fx/fs/etc/tunnelsats" "$fx/fs/etc/systemd/system/lightningd.service.d"
+run_snippet "$fx" 'TS_M_INV_STATE=installed TS_M_INV_PROFILE=raspiblitz TS_M_INV_IMPL=cln TS_M_INV_UNIT=lightningd.service TS_M_INV_USER=bitcoin TS_M_INV_UID=1001 TS_M_INV_BACKSTOP=0
+TS_M_FILES=() TS_M_FILE_SHA=() TS_M_CREATED_DIRS=() TS_M_ENABLED_UNITS=()
+ts_m_inventory_write'
+printf '[Service]\nSlice=tunnelsats.slice\n' > "$fx/fs/etc/systemd/system/lightningd.service.d/tunnelsats-managed.conf"
+printf '%s\n' "$WG_CONF" > "$fx/fs/etc/wireguard/tunnelsatsv2.conf"
+gen detect_managed_cln

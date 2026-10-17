@@ -110,6 +110,14 @@ TOOL_ANNOUNCE_RESULTS = ("removed", "none", "lnd_not_ready", "failed", "skipped"
 BOOT_OFF = ("disabled", "masked", "masked-runtime")
 # an IPv4 address with a port, as the tool's announcement warnings name them
 ADDRESS_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b")
+# REPAIR and IMPORT check the node only once the Lightning unit the tool or the module (re)started
+# has left "activating" (LND until it is ready, Type=notify; verify reports such a start as
+# degraded): at most LN_START_WAIT seconds, read every LN_START_STEP seconds
+LN_START_WAIT = 90
+LN_START_STEP = 3
+# the drop-in with which install --managed puts the managed unit into the slice, as detect reports it
+# (artifact managed_ln_dropin)
+DROPIN_RE = re.compile(r"/etc/systemd/system/([A-Za-z0-9_.@-]+\.service)\.d/tunnelsats-managed\.conf")
 
 # Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
 KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
@@ -989,6 +997,60 @@ def wait_for_handshake(deps, seconds=60, step=5):
         waited += step
 
 
+def wait_until_started(deps, unit, limit=LN_START_WAIT, step=LN_START_STEP):
+    """REPAIR and IMPORT, before their final check, after the tool or the module (re)started unit:
+    waits while it is "activating" (LND until it is ready, Type=notify), at most limit seconds,
+    because verify reports a start in progress as degraded. Returns the record for the result:
+    unit, state (read last; "auto-restart" for a unit that keeps failing), waited_s and outcome:
+    "active", "not_running" (it was not starting), "failed" (it stopped while starting, or it waits
+    in auto-restart after a failed start) or "timeout" (still starting at the limit)."""
+    started, waited = deps.clock(), 0
+    state = unit_props(deps, unit, "ActiveState")["ActiveState"]
+    starting = state == "activating"
+    while state == "activating" and waited < limit and (deps.clock() - started).total_seconds() < limit:
+        deps.sleep(step)
+        waited += step
+        state = unit_props(deps, unit, "ActiveState")["ActiveState"]
+    if state == "active":
+        outcome = "active"
+    elif state == "activating":
+        # Restart=always (RestartSec=60): "activating" with SubState auto-restart is the pause after
+        # a start that failed, not a start in progress; one read, only when the wait ends here
+        if unit_props(deps, unit, "SubState")["SubState"] == "auto-restart":
+            outcome, state = "failed", "auto-restart"
+        else:
+            outcome = "timeout"
+    else:
+        outcome = "failed" if starting else "not_running"
+    return {"unit": unit, "state": state or "unknown", "waited_s": waited, "outcome": outcome}
+
+
+def start_wait_detail(wait):
+    """Why the final check saw a start that did not finish, or None."""
+    if not wait:
+        return None
+    if wait["outcome"] == "timeout":
+        hint = " (LND stays starting until its wallet is unlocked)" if wait["unit"] == UNITS["lnd"] else ""
+        return ("%s was still starting after %d s, so this check ran while it starts%s: run CHECK again once it "
+                "runs" % (wait["unit"], wait["waited_s"], hint))
+    if wait["outcome"] == "failed":
+        return ("%s stopped while starting (%s): see journalctl -u %s, then REPAIR"
+                % (wait["unit"], wait["state"], wait["unit"]))
+    return None
+
+
+def with_start_wait(checked, wait):
+    """The check result with a start that did not finish as a failed degraded check (ln_start), so
+    the verdict is never protected for it."""
+    detail = start_wait_detail(wait)
+    if detail:
+        checked["checks"].append({"id": "ln_start", "class": "degraded", "result": "fail", "detail": detail})
+        checked["reasons"].append("ln_start")
+        if checked["verdict"] == "protected":
+            checked["verdict"] = "degraded"
+    return checked
+
+
 # ------------------------------------------------------------------------------------------
 # import
 # ------------------------------------------------------------------------------------------
@@ -1051,7 +1113,8 @@ def cmd_import(deps, args, result):
     cfg = parse_wg_config(data)
     result.fields.update({"valid": True, "warnings": cfg["warnings"], "public_key": cfg["public_key"],
                           "public_key_matches": cfg["public_key_matches"],
-                          "endpoint": {"host": cfg["endpoint_host"]}, "vpn_port": cfg["vpn_port"]})
+                          "endpoint": {"host": cfg["endpoint_host"]}, "vpn_port": cfg["vpn_port"],
+                          "ln_start_wait": None})
     state = load_state(deps)
     if state and state.get("public_key") != cfg["public_key"]:
         raise ModuleError("E_ALREADY_CONFIGURED", "refused",
@@ -1079,14 +1142,18 @@ def cmd_import(deps, args, result):
     with Lock(deps, wait=30):
         activate(deps, impl, result,
                  stored_writer=lambda: store_subscription(deps, cfg, "managed", impl, outcome, api_data))
-    finish_with_check(deps, result)
+    # the tool's install restarted a running unit: the check waits until that start is done
+    finish_with_check(deps, result, wait_until_started(deps, UNITS[impl]))
 
 
-def finish_with_check(deps, result):
-    checked = run_check(deps)
+def finish_with_check(deps, result, wait=None):
+    result.fields["ln_start_wait"] = wait
+    checked = with_start_wait(run_check(deps), wait)
     result.fields["verdict"] = checked["verdict"]
     result.fields["guard"] = checked["guard"]
     result.fields["check"] = {"reasons": checked["reasons"], "restart_needed": checked["restart_needed"]}
+    if start_wait_detail(wait):
+        result.fields["warnings"] = list(result.fields.get("warnings") or []) + [start_wait_detail(wait)]
     result.exit_code = verdict_exit(checked["verdict"])
 
 
@@ -1699,11 +1766,12 @@ def at_rest_action(impl, doc, unit, then):
             "lines": lines, "then": then}
 
 
-def keep_pending_removal(deps, unit, doc, reason=None):
+def keep_pending_removal(deps, unit, doc, reason=None, tunnel=None):
     """Records in state.json that a refused or unfinished REMOVE left unit stopped (and disabled,
     per uninstall document doc): the menu then offers REMOVE again instead of START, and the next
     REMOVE enables and starts the unit once the removal is complete and its config is Tor-only at rest.
-    reason: why REMOVE ended with the dataplane still in place (stop_failed, disable_failed), for the menu."""
+    reason: what REMOVE could not do to the unit (stop_failed, disable_failed); tunnel: where the
+    tunnel stood then (in_place, removed, partly_removed). Both for the menu."""
     if not unit or not (doc.get("ln_disabled") or (doc.get("ln_was_active") and not doc.get("ln_started"))):
         return
     state = load_state(deps)
@@ -1712,7 +1780,7 @@ def keep_pending_removal(deps, unit, doc, reason=None):
     state["remove_pending"] = {"unit": unit, "ln_was_active": bool(doc.get("ln_was_active")),
                                "ln_disabled": bool(doc.get("ln_disabled")), "at": now_iso(deps)}
     if reason:
-        state["remove_pending"]["reason"] = reason
+        state["remove_pending"].update({"reason": reason, "tunnel": tunnel or "in_place"})
     save_state(deps, state)
 
 
@@ -1743,7 +1811,19 @@ def managed_unit(deps):
     return unit if unit in UNITS.values() else None
 
 
-def stop_unless_tor_only(deps, unit):
+def dropin_unit(found):
+    """The Lightning unit of the managed install as the detect document found names it: the one unit
+    whose drop-in from install --managed is present (artifact managed_ln_dropin). None when there is
+    no such drop-in, more than one, or one for a unit RaspiBlitz does not tunnel."""
+    units = set()
+    for art in ((found or {}).get("install") or {}).get("artifacts") or []:
+        if isinstance(art, dict) and art.get("id") == "managed_ln_dropin" and art.get("status") == "present":
+            match = DROPIN_RE.fullmatch(str(art.get("location") or ""))
+            units.add(match.group(1) if match else None)
+    return units.pop() if len(units) == 1 and units <= set(UNITS.values()) else None
+
+
+def stop_unless_tor_only(deps, unit, managed=None):
     """REMOVE, before uninstall --managed. Since tunnelsats PR 227 the tool starts the unit it stopped
     again itself when its own check of the node config finds no TunnelSats clearnet settings. That
     check is narrower than the at-rest audit (for LND it leaves out externalip, an empty externalhosts
@@ -1753,20 +1833,23 @@ def stop_unless_tor_only(deps, unit):
     therefore stopped here while the dataplane still holds, recorded as remove_pending before the
     stop, and disabled. The tool then neither stops nor starts it, and this REMOVE repairs the config
     and enables and starts the unit after its own audit, or keeps it stopped and disabled, as after a
-    refused REMOVE. A unit verify names as not the managed one is never touched. Returns (record or
-    None, outcome): "skipped", "stopped", or, when the tool must not run, "stop_failed" (the record
-    has the state read back in "state") or "disable_failed" (still enabled: without the dataplane
-    the next boot would start it with that config)."""
+    refused REMOVE. managed: the managed unit as detect names it (dropin_unit), used as it is, also
+    when state.impl names another, stopped unit; without it, verify --no-probe is asked once a stop is
+    due, and a unit it names as not the managed one is never touched. Returns (record or None,
+    outcome): "skipped", "stopped", or, when the tool must not run, "stop_failed" (the record has the
+    state read back in "state") or "disable_failed" (still enabled: without the dataplane the next
+    boot would start it with that config)."""
+    unit = managed or unit
     impl = IMPL_OF_UNIT.get(unit) if unit else None
     if impl is None:
         return None, "skipped"
     props = unit_props(deps, unit, "ActiveState", "UnitFileState")
     if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
         return None, "skipped"
-    managed = managed_unit(deps)
-    if managed and managed != unit:
+    found = None if managed else managed_unit(deps)
+    if found and found != unit:
         # state.impl does not name the managed install: only its unit is stopped, never another one
-        unit, impl = managed, IMPL_OF_UNIT[managed]
+        unit, impl = found, IMPL_OF_UNIT[found]
         props = unit_props(deps, unit, "ActiveState", "UnitFileState")
         if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
             return None, "skipped"
@@ -1775,7 +1858,7 @@ def stop_unless_tor_only(deps, unit):
     systemctl(deps, "stop", unit)
     record["state"] = unit_props(deps, unit, "ActiveState")["ActiveState"] or "unknown"
     if record["state"] not in ("inactive", "failed"):
-        keep_pending_removal(deps, unit, record, reason="stop_failed")
+        keep_pending_removal(deps, unit, record, reason="stop_failed", tunnel="in_place")
         return record, "stop_failed"
     if props["UnitFileState"] not in BOOT_OFF:
         # recorded before the disable: a REMOVE that ends here leaves the next one to enable it again
@@ -1784,7 +1867,7 @@ def stop_unless_tor_only(deps, unit):
         systemctl(deps, "disable", unit)
         if unit_props(deps, unit, "UnitFileState")["UnitFileState"] not in BOOT_OFF:
             record["ln_disabled"] = False
-            keep_pending_removal(deps, unit, record, reason="disable_failed")
+            keep_pending_removal(deps, unit, record, reason="disable_failed", tunnel="in_place")
             return record, "disable_failed"
     return record, "stopped"
 
@@ -1866,10 +1949,14 @@ def cmd_uninstall(deps, args, result):
         notes = []
         result.fields["warnings"] = notes
         if managed:
+            # the unit of the managed install: detect names its drop-in (no extra call), which also
+            # holds when state.impl names the other implementation; else the stored implementation's
+            dropin = dropin_unit(tool)
+            unit = dropin or unit
             # an earlier REMOVE that did not finish may have stopped the unit (read while it is stopped)
             pending = pending_removal(deps, state)
             if pending is None:
-                pending, outcome = stop_unless_tor_only(deps, unit)
+                pending, outcome = stop_unless_tor_only(deps, unit, managed=dropin)
                 result.fields["ln_stopped_first"] = outcome in ("stopped", "disable_failed")
                 unit = pending["unit"] if pending else unit
                 if outcome in ("stop_failed", "disable_failed"):
@@ -1952,13 +2039,15 @@ def cmd_uninstall(deps, args, result):
             if "E_LN_STOP" in tool_errors:
                 # the tool removed nothing: the unit did not stop, the tunnel and its kill switch stay
                 state_now = (unit_props(deps, unit, "ActiveState")["ActiveState"] if unit else "") or "unknown"
-                keep_pending_removal(deps, unit, dict(doc, ln_was_active=True, ln_started=False), reason="stop_failed")
+                keep_pending_removal(deps, unit, dict(doc, ln_was_active=True, ln_started=False), reason="stop_failed",
+                                     tunnel="in_place")
                 result.error("E_LN_STOP", "operational",
                              "%s did not stop (state: %s), so the TunnelSats uninstall removed nothing. The tunnel "
                              "and its kill switch stay in place; run REMOVE again" % (unit, state_now), EXIT_OPERATIONAL)
                 return
             # the next REMOVE finds the unit stopped by this one in remove_pending and starts it again
-            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc)
+            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc, reason=problem,
+                                 tunnel="partly_removed")
             left = "removal incomplete: %s; " % ", ".join(result.fields["remaining"])
             if problem:
                 keep_off_error(result, problem, unit, state_now, left)
@@ -1994,7 +2083,8 @@ def cmd_uninstall(deps, args, result):
                 "detail": "; ".join(a["detail"] for a in actions),
                 "lines": [line for a in actions for line in a["lines"]],
                 "then": then}
-            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc)
+            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc, reason=problem,
+                                 tunnel="removed")
             if problem:
                 keep_off_error(result, problem, unit, state_now, "; ".join(messages + [""]))
             else:
@@ -2067,7 +2157,7 @@ def cmd_repair(deps, args, result):
         raise ModuleError("E_NOT_ELIGIBLE", "not_eligible", "no Lightning implementation to tunnel (%s)" % why,
                           EXIT_NOT_CONFIGURED)
     actions = []
-    result.fields["actions"] = actions
+    result.fields.update({"actions": actions, "ln_start_wait": None})
     with Lock(deps, wait=30):
         rc, tool = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
         managed = ((tool or {}).get("install") or {}).get("kind") == "managed"
@@ -2117,8 +2207,14 @@ def cmd_repair(deps, args, result):
             actions.append("block" if rc == 0 else "block_failed")
             deps.run([ITS, "tick-timer", "on"], timeout=60)
             actions.append("tick_timer")
-    checked = run_check(deps)
+    # the reinstall restarted a running unit (the tool's install, or the start above): the check
+    # waits until that start is done; the path without a restart makes no wait
+    wait = wait_until_started(deps, unit) if "install" in actions else None
+    result.fields["ln_start_wait"] = wait
+    checked = with_start_wait(run_check(deps), wait)
     result.fields.update(checked)
+    if start_wait_detail(wait):
+        result.fields["warnings"] = list(result.fields.get("warnings") or []) + [start_wait_detail(wait)]
     result.exit_code = verdict_exit(checked["verdict"])
 
 
@@ -2286,18 +2382,28 @@ def menu_choices(deps, state, conf, found=None):
 
 def pending_removal_text(deps, pending):
     """The notice after a REMOVE that did not finish: the live state of the unit it recorded (never the
-    record alone, which is written before the stop), whether the tunnel is still in place (REMOVE
-    stopped before the tool), and a fresh read-only audit of the unit's config."""
+    record alone, which is written before the stop), where the tunnel stands (in place when REMOVE
+    stopped before the tool; removed, or partly removed, when REMOVE could not stop or disable the
+    unit afterwards, with the command to run), and a fresh read-only audit of the unit's config."""
     unit = pending["unit"]
     props = unit_props(deps, unit, "ActiveState", "UnitFileState")
     running = props["ActiveState"] not in ("inactive", "failed")
-    stopped = "stopped and disabled" if props["UnitFileState"] in BOOT_OFF else "stopped"
-    reason = pending.get("reason")
-    if reason in ("stop_failed", "disable_failed"):
+    boot = props["UnitFileState"] not in BOOT_OFF
+    stopped = "stopped and disabled" if not boot else "stopped"
+    reason, tunnel = pending.get("reason"), pending.get("tunnel") or "in_place"
+    what = "did not stop" if reason == "stop_failed" else "could not be disabled"
+    command = None
+    if reason in ("stop_failed", "disable_failed") and tunnel != "in_place":
+        now = ("%s still runs (%s)" % (unit, props["ActiveState"] or "state unknown") if running
+               else "%s is stopped but still enabled" % unit if boot else "%s is %s" % (unit, stopped))
+        text = "REMOVE did not finish: the tunnel is %s, and %s %s; %s" % (
+            "already removed" if tunnel == "removed" else "partly removed", unit, what, now)
+        command = ("systemctl disable --now %s" if running and boot else "systemctl stop %s" if running
+                   else "systemctl disable %s" if boot else None)
+    elif reason in ("stop_failed", "disable_failed"):
         now = "%s still runs (%s)" % (unit, props["ActiveState"] or "state unknown") if running \
             else "%s is %s" % (unit, stopped)
-        text = "REMOVE did not finish: %s %s, so the tunnel and its kill switch stay in place; %s" % (
-            unit, "did not stop" if reason == "stop_failed" else "could not be disabled", now)
+        text = "REMOVE did not finish: %s %s, so the tunnel and its kill switch stay in place; %s" % (unit, what, now)
     elif running:
         text = "REMOVE did not finish: %s still runs (%s)" % (unit, props["ActiveState"] or "state unknown")
     else:
@@ -2305,9 +2411,14 @@ def pending_removal_text(deps, pending):
     then = "it checks the config first" if running else "it checks the config, then starts %s" % unit
     rc, audit = its(deps, ["audit", IMPL_OF_UNIT[unit], "--json"], timeout=30)
     if audit and audit.get("status") == "clean":
+        # Tor-only now: running or starting without the tunnel is fine, so no stop or disable command
         return text + ". Its config is Tor-only now: choose REMOVE again to finish; %s." % (
             "it enables and starts %s" % unit if not running else "it checks the config first")
-    text += ": its config is not Tor-only at rest"
+    if command:
+        text += ". Run now: sudo %s, so that it neither runs nor starts without the tunnel. Its" % (command % unit)
+    else:
+        text += ": its"
+    text += " config is not Tor-only at rest"
     lines = [line for line in (audit or {}).get("lines") or [] if isinstance(line, str)][:8]
     if lines:
         text += ". Remove these lines:\n" + "\n".join("  %s" % line for line in lines)

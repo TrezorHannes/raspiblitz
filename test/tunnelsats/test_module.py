@@ -75,6 +75,9 @@ class FakeSystem:
         self.hooks = []
         self.systemctl_rc = {}
         self.systemctl_noop = set()
+        # unit -> [reads, final]: a unit that is starting (Type=notify) reads back "activating" for that
+        # many ActiveState reads, then final; systemctl start or restart joins that start
+        self.starting = {}
         self.its = {
             "audit lnd": (0, {"status": "clean", "eligible": True, "keys": [], "reason": None,
                               "not_eligible_reason": None}),
@@ -147,10 +150,18 @@ class FakeSystem:
             if argv[1] == "show":
                 unit = argv[-1]
                 props = [argv[i + 1] for i in range(len(argv)) if argv[i] == "-p"]
+                if unit in self.starting and "ActiveState" in props:
+                    if self.starting[unit][0] > 0:
+                        self.starting[unit][0] -= 1
+                        self.units[unit]["ActiveState"] = "activating"
+                    else:
+                        self.units[unit]["ActiveState"] = self.starting.pop(unit)[1]
                 values = self.units.get(unit, {})
                 return 0, "".join("%s=%s\n" % (p, values.get(p, "")) for p in props), ""
             if self.systemctl_rc.get((argv[1], argv[-1])):
                 return self.systemctl_rc[(argv[1], argv[-1])], "", "Job for %s failed." % argv[-1]
+            if argv[1] in ("start", "restart") and argv[-1] in self.starting:
+                return 0, "", ""
             if self.stateful and argv[-1] in self.units and (argv[1], argv[-1]) not in self.systemctl_noop:
                 state = {"start": ("ActiveState", "active"), "restart": ("ActiveState", "active"),
                          "stop": ("ActiveState", "inactive"), "enable": ("UnitFileState", "enabled"),
@@ -293,6 +304,18 @@ class ModuleTestCase(unittest.TestCase):
         fake.its["uninstall"] = uninstall
         if still_managed:
             fake.its["detect"] = (0, fixture_json("tool", "detect_managed.json"))
+
+    def starts_after_install(self, reads, final="active", unit="lnd.service"):
+        """The tool's install --managed restarts unit, which stays activating (LND until it is ready,
+        Type=notify) for that many reads of its ActiveState, then reads back final."""
+        def hook(argv):
+            if argv[:2] == [mod.ITS, "install"]:
+                self.fake.units[unit]["ActiveState"] = "activating"
+                self.fake.starting[unit] = [reads, final]
+        self.fake.hooks.append(hook)
+
+    def start_steps(self):
+        return [s for s in self.fake.sleeps if s == mod.LN_START_STEP]
 
     def run_verb(self, *argv):
         out = io.StringIO()
@@ -671,6 +694,36 @@ class TestImport(ModuleTestCase):
         self.assertEqual((2, "E_CONFIG_NO_PORT"), (doc["exit_code"], doc["errors"][0]["code"]))
         doc = self.run_verb("import", "--file", self.path("missing.conf"))
         self.assertEqual((2, "E_FILE"), (doc["exit_code"], doc["errors"][0]["code"]))
+
+    # -- the check after the activation waits until the restarted Lightning unit has started --
+    def test_the_check_waits_until_lightning_has_started(self):
+        # the tool's install restarts LND, which stays activating until it is ready (Type=notify)
+        self.record()
+        self.starts_after_install(3)
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual((0, "protected"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "active", "waited_s": 9, "outcome": "active"},
+                         doc["ln_start_wait"])
+        self.assertEqual([mod.LN_START_STEP] * 3, self.start_steps())
+        self.assertNotIn("ln_start", doc["check"]["reasons"])
+
+    def test_a_start_that_does_not_finish_is_reported_never_passed(self):
+        self.record()
+        self.starts_after_install(1000)
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "activating", "waited_s": mod.LN_START_WAIT,
+                          "outcome": "timeout"}, doc["ln_start_wait"])
+        self.assertEqual(mod.LN_START_WAIT // mod.LN_START_STEP, len(self.start_steps()))
+        self.assertIn("ln_start", doc["check"]["reasons"])
+        self.assertIn("still starting after %d s" % mod.LN_START_WAIT, mod.result_text(doc) + json.dumps(doc))
+
+    def test_lightning_that_was_stopped_is_not_waited_for(self):
+        self.fake.units["lnd.service"]["ActiveState"] = "inactive"
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual({"unit": "lnd.service", "state": "inactive", "waited_s": 0, "outcome": "not_running"},
+                         doc["ln_start_wait"])
+        self.assertEqual([], self.start_steps())
 
 
 # ------------------------------------------------------------------------------------------
@@ -1306,6 +1359,72 @@ class TestRemove(ModuleTestCase):
         # LND is the other implementation now: left as it is, with its lines as a warning
         self.assertIn("lnd.service was left as it is", doc["warnings"][0])
 
+    # -- issue 3 -----------------------------------------------------------------------------
+    def test_the_pre_stop_finds_the_managed_unit_through_its_drop_in(self):
+        # note 1: state.impl names LND, which is stopped; the managed install is CLN's, and detect
+        # names its drop-in (no extra call). CLN runs with a config that is not Tor-only at rest.
+        self.fake.its["detect"] = [(0, fixture_json("tool", "detect_managed_cln.json")),
+                                   (0, fixture_json("tool", "detect_none.json"))]
+        self.fake.units["lnd.service"].update({"ActiveState": "inactive", "MainPID": "0", "ControlGroup": ""})
+        self.fake.units["lightningd.service"].update({"ActiveState": "active", "UnitFileState": "enabled",
+                                                      "ControlGroup": "/system.slice/lightningd.service"})
+        conf = self.write("cln/config", fixture("conf", "cl-config").replace("always-use-proxy=true", ""))
+        self.real_audit()
+        self.pinned_tool(unit="lightningd.service")
+        self.watch_the_stop(unit="lightningd.service")
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stopped_before_the_tool(doc, unit="lightningd.service")
+        self.assert_repaired_and_started(doc, unit="lightningd.service")
+        with open(conf) as handle:
+            self.assertIn("always-use-proxy=true", handle.read())
+        self.assertEqual([], self.fake.calls_of(mod.ITS, "verify"))
+        self.assertEqual([], [c for c in self.fake.calls if c[0] == "systemctl" and c[-1] == "lnd.service"
+                              and c[1] != "show"])
+
+    def notice(self):
+        return mod.menu_choices(self.deps, mod.load_state(self.deps), mod.read_rb_conf(self.deps))[1]
+
+    def test_the_menu_after_a_failed_disable_says_the_tunnel_is_removed_and_names_the_command(self):
+        # note 2: REMOVE removed the dataplane, then could not disable LND (config not Tor-only at rest)
+        self.remove_after_a_failed_disable()
+        self.fake.systemctl_rc[("disable", "lnd.service")] = 1
+        self.assertEqual("E_LN_DISABLE", self.run_verb("uninstall", "--yes")["errors"][0]["code"])
+        notice = self.notice()
+        self.assertIn("REMOVE did not finish: the tunnel is already removed", notice)
+        self.assertIn("lnd.service is stopped but still enabled", notice)
+        self.assertIn("Run now: sudo systemctl disable lnd.service", notice)
+        self.assertNotIn("stay in place", notice)
+        self.assertIn("externalhosts=qa.invalid:9735", notice)
+
+    def test_the_menu_after_a_failed_stop_says_the_tunnel_is_removed_and_names_the_command(self):
+        # note 2: the tool started LND again, REMOVE's audit then found the config not Tor-only at rest
+        # (changed after the check before the tool) and LND did not stop
+        self.tool_restarts_lnd()
+        line = "/mnt/hdd/app-data/lnd/lnd.conf:27:tor.skip-proxy-for-clearnet-targets=true"
+        self.fake.its["audit lnd"] = [(0, self.audit("clean")),
+                                      (4, self.audit("drift", None, [line], ["tor.skip-proxy-for-clearnet-targets"]))]
+        self.fake.systemctl_rc[("stop", "lnd.service")] = 1
+        self.assertEqual("E_LN_STOP", self.run_verb("uninstall", "--yes")["errors"][0]["code"])
+        notice = self.notice()
+        self.assertIn("REMOVE did not finish: the tunnel is already removed", notice)
+        self.assertIn("lnd.service still runs (active)", notice)
+        self.assertIn("Run now: sudo systemctl disable --now lnd.service", notice)
+        self.assertIn(line, notice)
+
+    def test_the_menu_names_no_command_once_the_config_is_tor_only(self):
+        # after a keep_off failure the operator made the config Tor-only: running or starting without
+        # the tunnel is fine now, so the notice asks for REMOVE again, not for a stop or a disable
+        self.remove_after_a_failed_disable()
+        self.fake.systemctl_rc[("disable", "lnd.service")] = 1
+        self.assertEqual("E_LN_DISABLE", self.run_verb("uninstall", "--yes")["errors"][0]["code"])
+        self.fake.its["audit lnd"] = (0, self.audit("clean"))
+        notice = self.notice()
+        self.assertIn("REMOVE did not finish: the tunnel is already removed", notice)
+        self.assertIn("Its config is Tor-only now: choose REMOVE again to finish; it enables and starts "
+                      "lnd.service.", notice)
+        self.assertNotIn("Run now", notice)
+        self.assertNotIn("systemctl", notice)
+
     def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
         self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))
@@ -1756,6 +1875,66 @@ class TestRepair(ModuleTestCase):
         doc = self.run_verb("repair", "--yes")
         self.assertEqual(["block", "tick_timer"], doc["actions"])
         self.assertEqual(-1, self.fake.index_of(mod.ITS, "uninstall"))
+        # nothing restarted Lightning: no wait before the check
+        self.assertEqual((None, []), (doc["ln_start_wait"], self.fake.sleeps))
+
+    # -- the check after the reinstall waits until the restarted Lightning unit has started --
+    def reinstall(self, reads, final="active", substate=None):
+        """REPAIR on a node without the managed install: it activates again, and the tool's install
+        restarts LND, which then stays activating for that many reads of its state (SubState
+        substate while it does)."""
+        self.store()
+        self.activate_conf()
+        self.record()
+        self.starts_after_install(reads, final)
+        if substate:
+            self.fake.units["lnd.service"]["SubState"] = substate
+        return self.run_verb("repair", "--yes")
+
+    def test_the_check_waits_until_lightning_has_started(self):
+        doc = self.reinstall(3)
+        self.assertEqual((0, "protected", ["install", "start"]), (doc["exit_code"], doc["verdict"], doc["actions"]), doc)
+        # one read by REPAIR's own start step, then the wait: two more starting reads, then active
+        self.assertEqual({"unit": "lnd.service", "state": "active", "waited_s": 6, "outcome": "active"},
+                         doc["ln_start_wait"])
+        self.assertEqual([mod.LN_START_STEP] * 2, self.start_steps())
+        self.assertNotIn("ln_start", doc["reasons"])
+
+    def test_a_start_that_does_not_finish_is_reported_never_passed(self):
+        # a slow start (SubState start, for example LND waiting for its wallet unlock)
+        doc = self.reinstall(1000, substate="start")
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "activating", "waited_s": mod.LN_START_WAIT,
+                          "outcome": "timeout"}, doc["ln_start_wait"])
+        check = [c for c in doc["checks"] if c["id"] == "ln_start"]
+        self.assertEqual([("degraded", "fail")], [(c["class"], c["result"]) for c in check])
+        self.assertIn("still starting after %d s" % mod.LN_START_WAIT, check[0]["detail"])
+        self.assertIn("ln_start", doc["reasons"])
+        self.assertIn(check[0]["detail"], doc["warnings"])
+
+    def test_a_crash_loop_is_reported_as_failed_not_as_a_slow_start(self):
+        # Restart=always, RestartSec=60: after each failed start the unit waits in activating with
+        # SubState auto-restart, so it reads activating for the whole wait
+        doc = self.reinstall(1000, substate="auto-restart")
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "auto-restart", "waited_s": mod.LN_START_WAIT,
+                          "outcome": "failed"}, doc["ln_start_wait"])
+        check = [c for c in doc["checks"] if c["id"] == "ln_start"]
+        self.assertIn("lnd.service stopped while starting (auto-restart): see journalctl -u lnd.service",
+                      check[0]["detail"])
+        self.assertNotIn("wallet", check[0]["detail"])
+        self.assertIn("ln_start", doc["reasons"])
+        # one read of SubState, only after the wait ended in activating
+        self.assertEqual(1, len([c for c in self.fake.calls if c[:2] == ["systemctl", "show"] and "SubState" in c]))
+
+    def test_a_unit_that_fails_while_starting_is_reported(self):
+        doc = self.reinstall(2, "failed")
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "failed", "waited_s": 3, "outcome": "failed"},
+                         doc["ln_start_wait"])
+        check = [c for c in doc["checks"] if c["id"] == "ln_start"]
+        self.assertIn("stopped while starting (failed)", check[0]["detail"])
+        self.assertIn("ln_start", doc["reasons"])
 
     def test_refusals(self):
         self.assertEqual(3, self.run_verb("repair", "--yes")["exit_code"])
