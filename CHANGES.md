@@ -1,7 +1,7 @@
 ## What's new in Version 1.12.2 of RaspiBlitz?
 
 - Update: BTCPayServer v2.3.9 [details](https://github.com/btcpayserver/btcpayserver/releases/tag/v2.3.9)
-- New: TunnelSats VPN subscription in SSH menu > SUBSCRIBE: import or take over a subscription, status, connection check and removal. Lightning stays Tor-only until the tunnel is verified, and TunnelSats is restored automatically after an SD-card update.
+- New: TunnelSats VPN subscription in SSH menu > SUBSCRIBE: import or take over a subscription, status, connection check and removal. Lightning stays Tor-only until the tunnel is verified, and TunnelSats is restored automatically after an SD-card update. Uses tunnelsats.sh 3.2, pinned at Tunnelsats/tunnelsats 49b72e3 [details](https://github.com/Tunnelsats/tunnelsats/blob/49b72e3ca2c29ebb4c7d8db885560d07ae25f082/docs/managed-mode.md)
 
 ## What's new in Version 1.12.1 of RaspiBlitz?
 
