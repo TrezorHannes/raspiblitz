@@ -1258,6 +1258,35 @@ class TestRemove(ModuleTestCase):
         self.assertNotIn("REMOVE left", notice)
         self.assertIn("externalip=203.0.113.7", notice)
 
+    ANOTHER = ("lnd.service also announces 203.0.113.9:24556, with the forwarded port of the TunnelSats config; if "
+               "that is a former VPN address, remove it with: sudo -u bitcoin /usr/local/bin/lncli "
+               "--lnddir=/home/bitcoin/.lnd --rpcserver=localhost:10009 peers updatenodeannouncement "
+               "--address_remove 203.0.113.9:24556")
+
+    def test_a_tool_warning_about_another_announced_address_is_shown(self):
+        self.tool_restarts_lnd()
+        self.record(ipv4="1.2.3.4")
+        uninstall = fixture_json("tool", "uninstall_clean.json")
+        uninstall["warnings"] = [self.ANOTHER]
+        self.fake.its["uninstall"] = (0, uninstall)
+        doc = self.run_verb("uninstall", "--yes")
+        self.assertEqual((0, "removed", [self.ANOTHER]), (doc["exit_code"], doc["tool_announce_cleanup"], doc["warnings"]), doc)
+        self.assertIn(self.ANOTHER, mod.result_text(doc))
+
+    def test_tool_warnings_stay_apart_when_removes_own_step_covers_them_or_the_tool_did_not_check(self):
+        failed = ("lnd.service still announces the former VPN address 1.2.3.4:24556: the update failed. Remove it "
+                  "with: sudo -u bitcoin /usr/local/bin/lncli peers updatenodeannouncement --address_remove 1.2.3.4:24556")
+        for outcome, warning in (("failed", failed), ("skipped", self.ANOTHER), ("lnd_not_ready", self.ANOTHER)):
+            with self.subTest(outcome):
+                self.fresh()
+                self.tool_restarts_lnd()
+                self.record(ipv4="1.2.3.4")
+                uninstall = fixture_json("tool", "uninstall_clean.json")
+                uninstall.update({"announce_cleanup": outcome, "warnings": [warning]})
+                self.fake.its["uninstall"] = (0, uninstall)
+                doc = self.run_verb("uninstall", "--yes")
+                self.assertEqual((0, [warning], []), (doc["exit_code"], doc["tool_warnings"], doc["warnings"]), doc)
+
     def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
         self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))

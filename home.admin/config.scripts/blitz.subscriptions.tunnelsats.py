@@ -108,6 +108,8 @@ RESTART_MESSAGE = ("TunnelSats: the tunnel is ready again. Restart Lightning to 
 TOOL_ANNOUNCE_RESULTS = ("removed", "none", "lnd_not_ready", "failed", "skipped")
 # unit file states in which no boot starts a unit (read back after systemctl disable)
 BOOT_OFF = ("disabled", "masked", "masked-runtime")
+# an IPv4 address with a port, as the tool's announcement warnings name them
+ADDRESS_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b")
 
 # Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
 KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
@@ -1562,15 +1564,24 @@ def announce_command(addresses):
                     [arg for address in addresses for arg in ("--address_remove", address)])
 
 
-def announce_cleanup(deps, unit, state, record, wait=120, step=5):
+def tool_announce_notes(outcome, warnings, candidates):
+    """The tool's announcement warnings REMOVE shows with its own notes: only when the tool's step did
+    check LND (removed, none, failed), and only those naming an address outside REMOVE's candidates,
+    such as another IPv4 with the forwarded port. REMOVE's own step covers its candidates."""
+    if outcome not in ("removed", "none", "failed"):
+        return []
+    return [w for w in warnings if set(ADDRESS_RE.findall(w)) - set(candidates)]
+
+
+def announce_cleanup(deps, unit, state, record, wait=120, step=5, candidates=None):
     """REMOVE, LND only. LND saves the addresses it announces and announces them again at every
     start when its config sets no externalip, so after REMOVE it would go on announcing the VPN
-    address. This takes exactly the VPN address (announce_candidates) out of LND's node
-    announcement once LND answers, never the onion address or any other one. Returns the outcome
-    (removed, none, lnd_not_ready, failed; skipped for CLN) and notes for the result."""
+    address. This takes exactly the VPN address (announce_candidates, or candidates when given) out
+    of LND's node announcement once LND answers, never the onion address or any other one. Returns
+    the outcome (removed, none, lnd_not_ready, failed; skipped for CLN) and notes for the result."""
     if unit != UNITS["lnd"]:
         return "skipped", []
-    candidates = announce_candidates(deps, state, record)
+    candidates = announce_candidates(deps, state, record) if candidates is None else candidates
     if not candidates:
         return "none", []
     info = None
@@ -1974,7 +1985,8 @@ def cmd_uninstall(deps, args, result):
                              "%s. Remove the listed TunnelSats settings%s" % (
                                  "; ".join(messages), ", then run: sudo %s" % then if then else ""), EXIT_OPERATIONAL)
             return
-        cleanup, cleanup_notes = announce_cleanup(deps, unit, state, record)
+        candidates = announce_candidates(deps, state, record) if unit == UNITS["lnd"] else []
+        cleanup, cleanup_notes = announce_cleanup(deps, unit, state, record, candidates=candidates)
         result.fields["announce_cleanup"] = cleanup
         leftovers, warnings = zero_artifacts(deps, impl)
         if other_action:
@@ -1985,7 +1997,8 @@ def cmd_uninstall(deps, args, result):
                                    "remove these settings: %s" % "; ".join(other_action["lines"])
                                    if other_action["lines"] else "check its config"))
         result.fields["artifacts"] = leftovers
-        result.fields["warnings"] = notes + warnings + cleanup_notes
+        result.fields["warnings"] = notes + warnings + cleanup_notes + tool_announce_notes(
+            result.fields["tool_announce_cleanup"], result.fields["tool_warnings"], candidates)
         if leftovers:
             result.error("E_ARTIFACTS_LEFT", "operational", "left behind: %s" % "; ".join(leftovers), EXIT_OPERATIONAL)
             return
