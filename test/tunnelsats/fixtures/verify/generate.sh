@@ -97,10 +97,10 @@ tunnel_down() {
 }
 
 # Writes the document cmd_verify --json --no-probe prints for the current fixture to $1.json and
-# checks that its exit code is $2.
+# checks that its exit code is $2. $3 (optional) is run before cmd_verify in the same snippet.
 gen() {
-    local out="${HERE}/$1.json" want="$2" doc
-    run_snippet "$fx" "WG_BIN='${STUB_BIN}/wg'; TS_JSON=1; TS_COMMAND=verify; TS_OUT_FD=1; TS_OPT_NO_PROBE=1; cmd_verify"
+    local out="${HERE}/$1.json" want="$2" pre="${3:-}" doc
+    run_snippet "$fx" "WG_BIN='${STUB_BIN}/wg'; ${pre} TS_JSON=1; TS_COMMAND=verify; TS_OUT_FD=1; TS_OPT_NO_PROBE=1; cmd_verify"
     doc=$(printf '%s\n' "$SN_OUT" | grep '^{"contract"' || true)
     if [[ "$SN_RC" -ne "$want" ]] || [[ -z "$doc" ]]; then
         echo "$1: exit ${SN_RC} (want ${want})" >&2
@@ -110,6 +110,16 @@ gen() {
     printf '%s\n' "$doc" > "$out"
     echo "wrote $1.json (exit ${SN_RC})"
 }
+
+# getent whose host lookups get no answer (a silent name server); everything else as the stub
+cat > "${TMP_ROOT}/getent-silent" <<EOF
+#!/bin/bash
+if [[ "\$1" == "ahostsv4" ]]; then sleep 20; fi
+exec "${STUB_BIN}/getent" "\$@"
+EOF
+chmod +x "${TMP_ROOT}/getent-silent"
+# verify bounds the endpoint lookup (5 s by default); 1 s keeps the generation short
+silent_dns="GETENT_BIN='${TMP_ROOT}/getent-silent'; export TS_VERIFY_RESOLVE_TIMEOUT=1;"
 
 for impl in lnd cln; do
     if [[ "$impl" == lnd ]]; then unit="lnd.service"; p=""; else unit="lightningd.service"; p="cln_"; fi
@@ -132,6 +142,10 @@ for impl in lnd cln; do
     managed_fixture "${p}dns" "$impl" "$unit"
     rm -f "$fx/state/resolve_de2.tunnelsats.com"
     gen "${p}activating_dns_unresolved" 5
+
+    # The name server does not answer: the lookup is cut off and reported as such (ipv4 null)
+    managed_fixture "${p}dnstimeout" "$impl" "$unit"
+    gen "${p}activating_dns_timeout" 5 "$silent_dns"
 
     managed_fixture "${p}mismatch" "$impl" "$unit"
     wg_state other

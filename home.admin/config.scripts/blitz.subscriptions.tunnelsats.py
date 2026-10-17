@@ -103,6 +103,13 @@ RESTARTABLE = ("emergency_block", "verify_timeout", "verify_unsafe", "verify_fai
                "verify_inconsistent", "not_installed", "tool_missing", "unit_mismatch", "announce_unconfirmed")
 RESTART_MESSAGE = ("TunnelSats: the tunnel is ready again. Restart Lightning to resume clearnet connections "
                    "(SSH menu > SUBSCRIBE > TunnelSats).")
+# announce_cleanup of the tool's uninstall --managed (contract 1, additive since tunnelsats PR 230): its
+# own step that takes the former VPN address out of LND's node announcement
+TOOL_ANNOUNCE_RESULTS = ("removed", "none", "lnd_not_ready", "failed", "skipped")
+# unit file states in which no boot starts a unit (read back after systemctl disable)
+BOOT_OFF = ("disabled", "masked", "masked-runtime")
+# an IPv4 address with a port, as the tool's announcement warnings name them
+ADDRESS_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b")
 
 # Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
 KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
@@ -1495,17 +1502,24 @@ def cmd_check(deps, args, result):
 # uninstall (REMOVE)
 # ------------------------------------------------------------------------------------------
 
-def tool_uninstall(deps, unit):
+def tool_uninstall(deps, unit, own_disable=False):
     """uninstall --managed of the pinned tool, for REMOVE and REPAIR. Returns its document, with
-    "remaining" the list of what is left, and a note for the result or None. If the document does
-    not arrive (no list "remaining": a timeout, a crash, no single JSON document), the outcome is
-    read back instead of assumed: detect for the dataplane, systemd for unit before and after. A
-    lost report never turns a done removal into a failed one, and never a failed one into a done one."""
+    "remaining" the list of what is left and "tool_errors" the codes of the tool's errors, and a note
+    for the result or None. If the document does not arrive (no list "remaining": a timeout, a crash,
+    no single JSON document, or a failure such as E_LN_STOP before the removal), the outcome is read
+    back instead of assumed: detect for the dataplane, systemd for unit before and after. A lost
+    report never turns a done removal into a failed one, and never a failed one into a done one.
+    own_disable (REMOVE, which disables the unit itself when its config is not Tor-only at rest):
+    a report whose only error is E_LN_DISABLE, the tool removed the dataplane but could not disable
+    the unit, counts as a complete removal."""
     before = unit_props(deps, unit, "ActiveState", "UnitFileState") if unit else {}
     rc, doc = its(deps, ["uninstall", "--json"], timeout=ITS_TIMEOUT["uninstall"])
     doc = doc if isinstance(doc, dict) else {}
+    codes = [e["code"] for e in doc.get("errors") or [] if isinstance(e, dict) and isinstance(e.get("code"), str)
+             and re.fullmatch(r"E_[A-Z0-9_]{1,40}", e["code"])][:10]
     if isinstance(doc.get("remaining"), list):
-        return dict(doc, remaining=doc["remaining"] or ([] if rc == 0 else ["managed dataplane"])), None
+        done = rc == 0 or (own_disable and codes == ["E_LN_DISABLE"])
+        return dict(doc, remaining=doc["remaining"] or ([] if done else ["managed dataplane"]), tool_errors=codes), None
     _rc, found = its(deps, ["detect", "--json"], timeout=ITS_TIMEOUT["detect"])
     kind = ((found or {}).get("install") or {}).get("kind")
     removed = isinstance(kind, str) and kind not in ("managed", "unknown")
@@ -1514,15 +1528,18 @@ def tool_uninstall(deps, unit):
             "ln_was_active": before.get("ActiveState") not in (None, "", "inactive", "failed"),
             "ln_disabled": (before.get("UnitFileState") in ("enabled", "enabled-runtime")
                             and after.get("UnitFileState") == "disabled"),
-            "ln_started": after.get("ActiveState") == "active", "node_config": "unknown"}
+            "ln_started": after.get("ActiveState") == "active", "node_config": "unknown", "tool_errors": codes}
     if removed:
         seen = "the dataplane is removed"
     elif isinstance(kind, str):
         seen = "the dataplane is still there"
     else:
         seen = "detect did not answer, so the removal counts as incomplete"
-    note = "the report of the TunnelSats uninstall did not arrive (%s); read back from the system: %s" % (
-        tool_error(doc, "E_TOOL_OUTPUT"), seen)
+    code = tool_error(doc, "E_TOOL_OUTPUT")
+    if code == "E_TOOL_OUTPUT":
+        note = "the report of the TunnelSats uninstall did not arrive (E_TOOL_OUTPUT); read back from the system: %s" % seen
+    else:
+        note = "the TunnelSats uninstall stopped with %s; read back from the system: %s" % (code, seen)
     return read, note
 
 
@@ -1547,15 +1564,24 @@ def announce_command(addresses):
                     [arg for address in addresses for arg in ("--address_remove", address)])
 
 
-def announce_cleanup(deps, unit, state, record, wait=120, step=5):
+def tool_announce_notes(outcome, warnings, candidates):
+    """The tool's announcement warnings REMOVE shows with its own notes: only when the tool's step did
+    check LND (removed, none, failed), and only those naming an address outside REMOVE's candidates,
+    such as another IPv4 with the forwarded port. REMOVE's own step covers its candidates."""
+    if outcome not in ("removed", "none", "failed"):
+        return []
+    return [w for w in warnings if set(ADDRESS_RE.findall(w)) - set(candidates)]
+
+
+def announce_cleanup(deps, unit, state, record, wait=120, step=5, candidates=None):
     """REMOVE, LND only. LND saves the addresses it announces and announces them again at every
     start when its config sets no externalip, so after REMOVE it would go on announcing the VPN
-    address. This takes exactly the VPN address (announce_candidates) out of LND's node
-    announcement once LND answers, never the onion address or any other one. Returns the outcome
-    (removed, none, lnd_not_ready, failed; skipped for CLN) and notes for the result."""
+    address. This takes exactly the VPN address (announce_candidates, or candidates when given) out
+    of LND's node announcement once LND answers, never the onion address or any other one. Returns
+    the outcome (removed, none, lnd_not_ready, failed; skipped for CLN) and notes for the result."""
     if unit != UNITS["lnd"]:
         return "skipped", []
-    candidates = announce_candidates(deps, state, record)
+    candidates = announce_candidates(deps, state, record) if candidates is None else candidates
     if not candidates:
         return "none", []
     info = None
@@ -1673,10 +1699,11 @@ def at_rest_action(impl, doc, unit, then):
             "lines": lines, "then": then}
 
 
-def keep_pending_removal(deps, unit, doc):
+def keep_pending_removal(deps, unit, doc, reason=None):
     """Records in state.json that a refused or unfinished REMOVE left unit stopped (and disabled,
     per uninstall document doc): the menu then offers REMOVE again instead of START, and the next
-    REMOVE enables and starts the unit once the removal is complete and its config is Tor-only at rest."""
+    REMOVE enables and starts the unit once the removal is complete and its config is Tor-only at rest.
+    reason: why REMOVE ended with the dataplane still in place (stop_failed, disable_failed), for the menu."""
     if not unit or not (doc.get("ln_disabled") or (doc.get("ln_was_active") and not doc.get("ln_started"))):
         return
     state = load_state(deps)
@@ -1684,6 +1711,8 @@ def keep_pending_removal(deps, unit, doc):
         return
     state["remove_pending"] = {"unit": unit, "ln_was_active": bool(doc.get("ln_was_active")),
                                "ln_disabled": bool(doc.get("ln_disabled")), "at": now_iso(deps)}
+    if reason:
+        state["remove_pending"]["reason"] = reason
     save_state(deps, state)
 
 
@@ -1706,14 +1735,107 @@ def clear_pending_removal(deps):
         save_state(deps, state)
 
 
+def managed_unit(deps):
+    """The Lightning unit of the managed install, as verify --no-probe names it (dataplane_healthy
+    reads it the same way), or None when verify does not name one."""
+    _rc, doc = its(deps, ["verify", "--no-probe", "--json"], timeout=ITS_TIMEOUT["verify_no_probe"])
+    unit = (doc or {}).get("unit")
+    return unit if unit in UNITS.values() else None
+
+
+def stop_unless_tor_only(deps, unit):
+    """REMOVE, before uninstall --managed. Since tunnelsats PR 227 the tool starts the unit it stopped
+    again itself when its own check of the node config finds no TunnelSats clearnet settings. That
+    check is narrower than the at-rest audit (for LND it leaves out externalip, an empty externalhosts
+    and tor.active, for CLN a missing always-use-proxy=true), with TunnelSats off the start guard
+    repairs nothing at that start, and the audit repairs only a stopped unit. A running unit of the
+    managed install whose config the audit does not find Tor-only at rest, or cannot check, is
+    therefore stopped here while the dataplane still holds, recorded as remove_pending before the
+    stop, and disabled. The tool then neither stops nor starts it, and this REMOVE repairs the config
+    and enables and starts the unit after its own audit, or keeps it stopped and disabled, as after a
+    refused REMOVE. A unit verify names as not the managed one is never touched. Returns (record or
+    None, outcome): "skipped", "stopped", or, when the tool must not run, "stop_failed" (the record
+    has the state read back in "state") or "disable_failed" (still enabled: without the dataplane
+    the next boot would start it with that config)."""
+    impl = IMPL_OF_UNIT.get(unit) if unit else None
+    if impl is None:
+        return None, "skipped"
+    props = unit_props(deps, unit, "ActiveState", "UnitFileState")
+    if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
+        return None, "skipped"
+    managed = managed_unit(deps)
+    if managed and managed != unit:
+        # state.impl does not name the managed install: only its unit is stopped, never another one
+        unit, impl = managed, IMPL_OF_UNIT[managed]
+        props = unit_props(deps, unit, "ActiveState", "UnitFileState")
+        if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
+            return None, "skipped"
+    record = {"unit": unit, "ln_was_active": True, "ln_disabled": False, "ln_started": False}
+    keep_pending_removal(deps, unit, record)
+    systemctl(deps, "stop", unit)
+    record["state"] = unit_props(deps, unit, "ActiveState")["ActiveState"] or "unknown"
+    if record["state"] not in ("inactive", "failed"):
+        keep_pending_removal(deps, unit, record, reason="stop_failed")
+        return record, "stop_failed"
+    if props["UnitFileState"] not in BOOT_OFF:
+        # recorded before the disable: a REMOVE that ends here leaves the next one to enable it again
+        record["ln_disabled"] = True
+        keep_pending_removal(deps, unit, record)
+        systemctl(deps, "disable", unit)
+        if unit_props(deps, unit, "UnitFileState")["UnitFileState"] not in BOOT_OFF:
+            record["ln_disabled"] = False
+            keep_pending_removal(deps, unit, record, reason="disable_failed")
+            return record, "disable_failed"
+    return record, "stopped"
+
+
+def keep_off(deps, unit):
+    """REMOVE, after the tool, when the config of unit is not Tor-only at rest: with TunnelSats off the
+    start guard repairs nothing, and the tunnel is gone or partly gone, so nothing may run or start
+    the unit with that config, now or at the next boot. Stops it if it runs and disables it unless no
+    boot starts it, each read back from systemd (never taken from the tool's report). Returns
+    (stopped_now, disabled_now, problem, state): problem None, "stop_failed" or "disable_failed",
+    state the ActiveState read back."""
+    props = unit_props(deps, unit, "ActiveState", "UnitFileState")
+    state = props["ActiveState"] or "unknown"
+    stopped_now = disabled_now = False
+    if state not in ("inactive", "failed"):
+        systemctl(deps, "stop", unit)
+        state = unit_props(deps, unit, "ActiveState")["ActiveState"] or "unknown"
+        if state not in ("inactive", "failed"):
+            return False, False, "stop_failed", state
+        stopped_now = True
+    if props["UnitFileState"] not in BOOT_OFF:
+        systemctl(deps, "disable", unit)
+        if unit_props(deps, unit, "UnitFileState")["UnitFileState"] not in BOOT_OFF:
+            return stopped_now, False, "disable_failed", state
+        disabled_now = True
+    return stopped_now, disabled_now, None, state
+
+
+def keep_off_error(result, problem, unit, state, prefix=""):
+    """E_LN_STOP or E_LN_DISABLE when keep_off could not stop or disable unit, with the command to run."""
+    if problem == "stop_failed":
+        result.error("E_LN_STOP", "operational",
+                     "%s%s did not stop (state: %s): it runs with a config that is not Tor-only at rest, and "
+                     "TunnelSats is off. Stop it with: sudo systemctl stop %s, then remove the listed TunnelSats "
+                     "settings and choose REMOVE again" % (prefix, unit, state, unit), EXIT_OPERATIONAL)
+    else:
+        result.error("E_LN_DISABLE", "operational",
+                     "%s%s is stopped but could not be disabled: with TunnelSats off, the next boot would start it "
+                     "with a config that is not Tor-only at rest. Run: sudo systemctl disable %s, then remove the "
+                     "listed TunnelSats settings and choose REMOVE again" % (prefix, unit, unit), EXIT_OPERATIONAL)
+
+
 def cmd_uninstall(deps, args, result):
     if not args.yes:
         raise ModuleError("E_CONFIRMATION_REQUIRED", "usage", "REMOVE needs --yes", EXIT_USAGE)
     state = load_state(deps)
     conf = read_rb_conf(deps)
     result.fields.update({"removed": False, "remaining": [], "ln_was_active": False, "ln_started": False,
-                          "ln_reenabled": False, "node_config": None, "block": None, "purged": False,
-                          "artifacts": [], "announce_cleanup": None})
+                          "ln_reenabled": False, "ln_stopped_first": False, "node_config": None, "block": None,
+                          "purged": False, "artifacts": [], "announce_cleanup": None, "tool_announce_cleanup": None,
+                          "tool_warnings": [], "tool_errors": []})
     if state and state.get("mode") == "adopted_legacy":
         with Lock(deps, wait=30):
             purge(deps)
@@ -1746,7 +1868,28 @@ def cmd_uninstall(deps, args, result):
         if managed:
             # an earlier REMOVE that did not finish may have stopped the unit (read while it is stopped)
             pending = pending_removal(deps, state)
-            doc, note = tool_uninstall(deps, unit)
+            if pending is None:
+                pending, outcome = stop_unless_tor_only(deps, unit)
+                result.fields["ln_stopped_first"] = outcome in ("stopped", "disable_failed")
+                unit = pending["unit"] if pending else unit
+                if outcome in ("stop_failed", "disable_failed"):
+                    # the tool would start the unit again with that config, or the next boot would start
+                    # it without the tunnel: the tool does not run, the dataplane and kill switch stay
+                    result.fields.update({"remaining": ["managed dataplane"], "ln_was_active": True})
+                    if outcome == "stop_failed":
+                        result.error("E_LN_STOP", "operational",
+                                     "%s did not stop (state: %s), so the TunnelSats uninstall did not run: it would "
+                                     "start %s again with a config that is not Tor-only at rest. The tunnel and its "
+                                     "kill switch stay in place; run REMOVE again" % (unit, pending["state"], unit),
+                                     EXIT_OPERATIONAL)
+                    else:
+                        result.error("E_LN_DISABLE", "operational",
+                                     "%s could not be disabled, so the TunnelSats uninstall did not run: without the "
+                                     "tunnel, the next boot would start it with a config that is not Tor-only at "
+                                     "rest. %s stays stopped, and the tunnel and its kill switch stay in place; run "
+                                     "REMOVE again" % (unit, unit), EXIT_OPERATIONAL)
+                    return
+            doc, note = tool_uninstall(deps, unit, own_disable=True)
             if note:
                 notes.append(note)
             unit = doc.get("unit") if doc.get("unit") in UNITS.values() else unit
@@ -1754,7 +1897,13 @@ def cmd_uninstall(deps, args, result):
                 doc = dict(doc, ln_was_active=bool(doc.get("ln_was_active")) or pending["ln_was_active"],
                            ln_disabled=bool(doc.get("ln_disabled")) or pending["ln_disabled"])
             result.fields.update({"remaining": doc["remaining"], "ln_was_active": bool(doc.get("ln_was_active")),
-                                  "ln_started": bool(doc.get("ln_started")), "node_config": doc.get("node_config")})
+                                  "ln_started": bool(doc.get("ln_started")), "node_config": doc.get("node_config"),
+                                  "tool_errors": doc.get("tool_errors") or []})
+            # the tool's own step for LND's node announcement, for the record: REMOVE checks the
+            # announcement again itself below, and only that step decides what REMOVE reports and warns
+            if doc.get("announce_cleanup") in TOOL_ANNOUNCE_RESULTS:
+                result.fields["tool_announce_cleanup"] = doc["announce_cleanup"]
+            result.fields["tool_warnings"] = [w for w in doc.get("warnings") or [] if isinstance(w, str)][:10]
         else:
             # a REMOVE refused earlier (config not Tor-only at rest) kept this unit stopped: this run
             # audits it again and enables and starts it only if the config is Tor-only now
@@ -1763,9 +1912,15 @@ def cmd_uninstall(deps, args, result):
                 doc = pending
                 unit = pending["unit"]
                 result.fields["ln_was_active"] = pending["ln_was_active"]
-        # uninstall --managed leaves the unit stopped and disabled when it cannot prove the node
-        # config clean (on RaspiBlitz always: ExecStart takes $TUNNELSATS_*_ARGS). Only this REMOVE's
-        # own audit of exactly that unit's implementation may undo it; the other one is checked too.
+        # uninstall --managed starts the unit again itself when it finds the node config clean (since
+        # tunnelsats PR 227 also with the start guard's variable in ExecStart: the env file this REMOVE
+        # deleted counts like an empty one). It leaves the unit stopped, and disabled, when the config
+        # holds TunnelSats settings or cannot be checked, and it never starts a unit that was not running
+        # when it began, such as one an earlier REMOVE left stopped (remove_pending) or one this REMOVE
+        # stopped first (stop_unless_tor_only). Then, and when the report was lost, only this REMOVE's
+        # own audit of exactly that unit's implementation may enable and start it; the other one is
+        # checked too. When that audit does not find the config Tor-only at rest, REMOVE itself makes
+        # sure the unit neither runs nor starts at the next boot (keep_off), whatever the tool reported.
         unit_impl = IMPL_OF_UNIT.get(unit) if unit else None
         main_ok = other_ok = True
         main_doc = other_doc = None
@@ -1777,16 +1932,41 @@ def cmd_uninstall(deps, args, result):
             main_ok = at_rest_ok(main_doc)
             other_ok = at_rest_ok(other_doc, installed_only=True)
         complete = not result.fields["remaining"]
+        tool_errors = result.fields["tool_errors"]
+        problem = state_now = None
+        if unit and not main_ok and (managed or pending) and "E_LN_STOP" not in tool_errors:
+            # TunnelSats is off and the tunnel is gone or partly gone, so no start guard repairs this
+            # config: nothing may run or start the unit with it, now or at the next boot. Read back from
+            # systemd, so a failed disable by the tool (E_LN_DISABLE) or a lost report is covered too
+            stopped_now, disabled_now, problem, state_now = keep_off(deps, unit)
+            if stopped_now:
+                doc = dict(doc, ln_was_active=True, ln_started=False)
+                result.fields.update({"ln_was_active": True, "ln_started": False})
+            if disabled_now:
+                doc = dict(doc, ln_disabled=True)
         if complete and main_ok and doc.get("ln_disabled") and unit:
             result.fields["ln_reenabled"] = systemctl(deps, "enable", unit)
         if complete and main_ok and doc.get("ln_was_active") and not doc.get("ln_started") and unit:
             result.fields["ln_started"] = systemctl(deps, "start", unit)
         if not complete:
+            if "E_LN_STOP" in tool_errors:
+                # the tool removed nothing: the unit did not stop, the tunnel and its kill switch stay
+                state_now = (unit_props(deps, unit, "ActiveState")["ActiveState"] if unit else "") or "unknown"
+                keep_pending_removal(deps, unit, dict(doc, ln_was_active=True, ln_started=False), reason="stop_failed")
+                result.error("E_LN_STOP", "operational",
+                             "%s did not stop (state: %s), so the TunnelSats uninstall removed nothing. The tunnel "
+                             "and its kill switch stay in place; run REMOVE again" % (unit, state_now), EXIT_OPERATIONAL)
+                return
             # the next REMOVE finds the unit stopped by this one in remove_pending and starts it again
-            keep_pending_removal(deps, unit, doc)
-            result.error("E_REMOVE_INCOMPLETE", "operational",
-                         "removal incomplete: %s; Lightning stays stopped, run REMOVE again" %
-                         ", ".join(result.fields["remaining"]), EXIT_OPERATIONAL)
+            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc)
+            left = "removal incomplete: %s; " % ", ".join(result.fields["remaining"])
+            if problem:
+                keep_off_error(result, problem, unit, state_now, left)
+            else:
+                state_now = (unit_props(deps, unit, "ActiveState")["ActiveState"] if unit else "") or "unknown"
+                running = bool(unit) and state_now not in ("inactive", "failed")
+                result.error("E_REMOVE_INCOMPLETE", "operational", "%s%s, run REMOVE again" % (
+                    left, "%s is %s" % (unit, state_now) if running else "Lightning stays stopped"), EXIT_OPERATIONAL)
             return
         other_action = None
         if not other_ok:
@@ -1795,7 +1975,9 @@ def cmd_uninstall(deps, args, result):
             other_action = at_rest_action(OTHER_IMPL[unit_impl], other_doc, other_unit, None)
         if not main_ok:
             then = None
-            if doc.get("ln_disabled"):
+            if problem:
+                messages = []
+            elif doc.get("ln_disabled"):
                 then = "systemctl enable --now %s" % unit
                 messages = ["%s stays stopped and disabled: its config is not Tor-only at rest" % unit]
             elif doc.get("ln_was_active") and not doc.get("ln_started"):
@@ -1812,12 +1994,16 @@ def cmd_uninstall(deps, args, result):
                 "detail": "; ".join(a["detail"] for a in actions),
                 "lines": [line for a in actions for line in a["lines"]],
                 "then": then}
-            keep_pending_removal(deps, unit, doc)
-            result.error("E_AT_REST_UNREPAIRABLE", "operational",
-                         "%s. Remove the listed TunnelSats settings%s" % (
-                             "; ".join(messages), ", then run: sudo %s" % then if then else ""), EXIT_OPERATIONAL)
+            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc)
+            if problem:
+                keep_off_error(result, problem, unit, state_now, "; ".join(messages + [""]))
+            else:
+                result.error("E_AT_REST_UNREPAIRABLE", "operational",
+                             "%s. Remove the listed TunnelSats settings%s" % (
+                                 "; ".join(messages), ", then run: sudo %s" % then if then else ""), EXIT_OPERATIONAL)
             return
-        cleanup, cleanup_notes = announce_cleanup(deps, unit, state, record)
+        candidates = announce_candidates(deps, state, record) if unit == UNITS["lnd"] else []
+        cleanup, cleanup_notes = announce_cleanup(deps, unit, state, record, candidates=candidates)
         result.fields["announce_cleanup"] = cleanup
         leftovers, warnings = zero_artifacts(deps, impl)
         if other_action:
@@ -1828,7 +2014,8 @@ def cmd_uninstall(deps, args, result):
                                    "remove these settings: %s" % "; ".join(other_action["lines"])
                                    if other_action["lines"] else "check its config"))
         result.fields["artifacts"] = leftovers
-        result.fields["warnings"] = notes + warnings + cleanup_notes
+        result.fields["warnings"] = notes + warnings + cleanup_notes + tool_announce_notes(
+            result.fields["tool_announce_cleanup"], result.fields["tool_warnings"], candidates)
         if leftovers:
             result.error("E_ARTIFACTS_LEFT", "operational", "left behind: %s" % "; ".join(leftovers), EXIT_OPERATIONAL)
             return
@@ -2098,14 +2285,29 @@ def menu_choices(deps, state, conf, found=None):
 
 
 def pending_removal_text(deps, pending):
-    """The notice after a refused REMOVE, from a fresh read-only audit of the unit it kept stopped."""
+    """The notice after a REMOVE that did not finish: the live state of the unit it recorded (never the
+    record alone, which is written before the stop), whether the tunnel is still in place (REMOVE
+    stopped before the tool), and a fresh read-only audit of the unit's config."""
     unit = pending["unit"]
-    stopped = "stopped and disabled" if pending.get("ln_disabled") else "stopped"
+    props = unit_props(deps, unit, "ActiveState", "UnitFileState")
+    running = props["ActiveState"] not in ("inactive", "failed")
+    stopped = "stopped and disabled" if props["UnitFileState"] in BOOT_OFF else "stopped"
+    reason = pending.get("reason")
+    if reason in ("stop_failed", "disable_failed"):
+        now = "%s still runs (%s)" % (unit, props["ActiveState"] or "state unknown") if running \
+            else "%s is %s" % (unit, stopped)
+        text = "REMOVE did not finish: %s %s, so the tunnel and its kill switch stay in place; %s" % (
+            unit, "did not stop" if reason == "stop_failed" else "could not be disabled", now)
+    elif running:
+        text = "REMOVE did not finish: %s still runs (%s)" % (unit, props["ActiveState"] or "state unknown")
+    else:
+        text = "REMOVE left %s %s" % (unit, stopped)
+    then = "it checks the config first" if running else "it checks the config, then starts %s" % unit
     rc, audit = its(deps, ["audit", IMPL_OF_UNIT[unit], "--json"], timeout=30)
     if audit and audit.get("status") == "clean":
-        return ("REMOVE left %s %s. Its config is Tor-only now: choose REMOVE again to finish; it enables "
-                "and starts %s." % (unit, stopped, unit))
-    text = "REMOVE left %s %s: its config is not Tor-only at rest" % (unit, stopped)
+        return text + ". Its config is Tor-only now: choose REMOVE again to finish; %s." % (
+            "it enables and starts %s" % unit if not running else "it checks the config first")
+    text += ": its config is not Tor-only at rest"
     lines = [line for line in (audit or {}).get("lines") or [] if isinstance(line, str)][:8]
     if lines:
         text += ". Remove these lines:\n" + "\n".join("  %s" % line for line in lines)
@@ -2113,7 +2315,7 @@ def pending_removal_text(deps, pending):
         text += " (the check did not answer)"
     else:
         text += " (%s)" % (audit.get("reason") or audit.get("status"))
-    return text + "\nThen choose REMOVE again: it checks the config, then starts %s." % unit
+    return text + "\nThen choose REMOVE again: %s." % then
 
 
 def menu_start(deps, restart=False):

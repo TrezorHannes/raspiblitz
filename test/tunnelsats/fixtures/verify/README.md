@@ -20,6 +20,7 @@ The fixture is a managed `raspiblitz` install (endpoint `de2.tunnelsats.com:5182
 | `activating_endpoint_none.json`, `cln_...` | interface up, no live endpoint yet | 5 |
 | `activating_tunnel_down.json`, `cln_...` | interface down | 5 |
 | `activating_dns_unresolved.json`, `cln_...` | the endpoint host does not resolve (`ipv4: null`) | 5 |
+| `activating_dns_timeout.json`, `cln_...` | the name server does not answer: verify cuts the endpoint lookup off (`ipv4: null`, `wg_endpoint` names the lookup; generated with `TS_VERIFY_RESOLVE_TIMEOUT=1`, the default is 5 s) | 5 |
 | `activating_endpoint_mismatch.json`, `cln_...` | live endpoint differs from the resolved one | 5 |
 | `activating_emergency_block.json`, `cln_...` | kill switch table gone, uid emergency block in effect (`emergency_block: true`) | 5 |
 | `activating_route_missing.json` | tunnel up, its route in table 51820 missing (degraded class) | 5 |

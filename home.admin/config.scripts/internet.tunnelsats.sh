@@ -20,16 +20,18 @@
 # ---------------------------------------------------------------------------------------------
 
 TS_PIN_VERSION="3.2"
-# web-flow signed squash merge on Tunnelsats/tunnelsats main
-TS_PIN_COMMIT="db70fd85bfa51afde199bb1152e94a24734c04c3"
-TS_PIN_SHA256="0cb360ae4b26d6ba8bb79a7fb0e98bc251357b31b906857a31c35a1f89008d6e"
+# web-flow signed squash merge on Tunnelsats/tunnelsats main (its PR 230, on top of PR 227)
+TS_PIN_COMMIT="49b72e3ca2c29ebb4c7d8db885560d07ae25f082"
+TS_PIN_SHA256="2ac2f2d9b5879419590d6faec9781b0a783fe3071c68d9e0bf72567e2015c72d"
 TS_PIN_SIGNER="web-flow"
 TS_PIN_KEY_URL="https://github.com/web-flow.gpg"
 # issuer of the signature of the pinned commit
 TS_PIN_KEY_FPR="B5690EEEBB952194"
 TS_PIN_CONTRACT=1
 # sha256 of every tunnelsats.sh the guard runs: the current pin plus pins shipped in earlier
-# RaspiBlitz releases (a node keeps working until REPAIR installs the newer pinned tool)
+# RaspiBlitz releases (a node keeps working until REPAIR installs the newer pinned tool). The
+# previous pin, db70fd8 (0cb360ae...), shipped in no release and is not accepted: its uninstall
+# removes the dataplane under a Lightning unit that is still starting (fixed in tunnelsats PR 227).
 TS_ACCEPTED_SHA256=("${TS_PIN_SHA256}")
 TS_REPO_URL="https://github.com/Tunnelsats/tunnelsats.git"
 

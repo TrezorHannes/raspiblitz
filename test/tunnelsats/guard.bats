@@ -167,6 +167,7 @@ protected.json                      hybrid   ok                  lnd    -
 activating_tunnel_up.json           hybrid   ok                  lnd    -
 activating_tunnel_down.json         hybrid   ok                  lnd    -
 activating_dns_unresolved.json      hybrid   ok                  lnd    -
+activating_dns_timeout.json         hybrid   ok                  lnd    -
 activating_endpoint_mismatch.json   hybrid   ok                  lnd    -
 activating_no_handshake.json        hybrid   ok                  lnd    -
 activating_endpoint_none.json       hybrid   ok                  lnd    -
@@ -205,6 +206,7 @@ EOF
 cln_protected.json                    hybrid   ok                   announce -
 cln_activating_tunnel_up.json         hybrid   ok                   announce -
 cln_activating_dns_unresolved.json    hybrid   announce_unconfirmed plain    dns_unresolved
+cln_activating_dns_timeout.json       hybrid   announce_unconfirmed plain    dns_unresolved
 cln_activating_endpoint_mismatch.json hybrid   announce_unconfirmed plain    endpoint_mismatch
 cln_activating_tunnel_down.json       hybrid   announce_unconfirmed plain    tunnel_down
 cln_activating_no_handshake.json      hybrid   announce_unconfirmed plain    no_handshake
@@ -662,9 +664,9 @@ EOF
     [ "$(tool_calls)" -eq 2 ]
 }
 
-@test "CLN wait: skipped on a mismatch, an unresolved name, a down tunnel or an unusable address" {
+@test "CLN wait: skipped on a mismatch, an unresolved name, an unanswered lookup, a down tunnel or an unusable address" {
     local doc
-    for doc in cln_activating_endpoint_mismatch.json cln_activating_dns_unresolved.json \
+    for doc in cln_activating_endpoint_mismatch.json cln_activating_dns_unresolved.json cln_activating_dns_timeout.json \
         cln_activating_tunnel_down.json cln_ipv4_private.json; do
         its_setup
         cln_node "$doc"
