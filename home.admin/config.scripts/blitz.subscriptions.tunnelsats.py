@@ -1735,25 +1735,41 @@ def clear_pending_removal(deps):
         save_state(deps, state)
 
 
+def managed_unit(deps):
+    """The Lightning unit of the managed install, as verify --no-probe names it (dataplane_healthy
+    reads it the same way), or None when verify does not name one."""
+    _rc, doc = its(deps, ["verify", "--no-probe", "--json"], timeout=ITS_TIMEOUT["verify_no_probe"])
+    unit = (doc or {}).get("unit")
+    return unit if unit in UNITS.values() else None
+
+
 def stop_unless_tor_only(deps, unit):
     """REMOVE, before uninstall --managed. Since tunnelsats PR 227 the tool starts the unit it stopped
     again itself when its own check of the node config finds no TunnelSats clearnet settings. That
     check is narrower than the at-rest audit (for LND it leaves out externalip, an empty externalhosts
     and tor.active, for CLN a missing always-use-proxy=true), with TunnelSats off the start guard
-    repairs nothing at that start, and the audit repairs only a stopped unit. A running unit whose
-    config the audit does not find Tor-only at rest, or cannot check, is therefore stopped here while
-    the dataplane still holds, recorded as remove_pending before the stop, and disabled. The tool
-    then neither stops nor starts it, and this REMOVE repairs the config and enables and starts the
-    unit after its own audit, or keeps it stopped and disabled, as after a refused REMOVE. Returns
-    (record or None, outcome): "skipped", "stopped", or, when the tool must not run, "stop_failed"
-    (the record has the state read back in "state") or "disable_failed" (still enabled: without the
-    dataplane the next boot would start it with that config)."""
+    repairs nothing at that start, and the audit repairs only a stopped unit. A running unit of the
+    managed install whose config the audit does not find Tor-only at rest, or cannot check, is
+    therefore stopped here while the dataplane still holds, recorded as remove_pending before the
+    stop, and disabled. The tool then neither stops nor starts it, and this REMOVE repairs the config
+    and enables and starts the unit after its own audit, or keeps it stopped and disabled, as after a
+    refused REMOVE. A unit verify names as not the managed one is never touched. Returns (record or
+    None, outcome): "skipped", "stopped", or, when the tool must not run, "stop_failed" (the record
+    has the state read back in "state") or "disable_failed" (still enabled: without the dataplane
+    the next boot would start it with that config)."""
     impl = IMPL_OF_UNIT.get(unit) if unit else None
     if impl is None:
         return None, "skipped"
     props = unit_props(deps, unit, "ActiveState", "UnitFileState")
     if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
         return None, "skipped"
+    managed = managed_unit(deps)
+    if managed and managed != unit:
+        # state.impl does not name the managed install: only its unit is stopped, never another one
+        unit, impl = managed, IMPL_OF_UNIT[managed]
+        props = unit_props(deps, unit, "ActiveState", "UnitFileState")
+        if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
+            return None, "skipped"
     record = {"unit": unit, "ln_was_active": True, "ln_disabled": False, "ln_started": False}
     keep_pending_removal(deps, unit, record)
     systemctl(deps, "stop", unit)
@@ -1855,6 +1871,7 @@ def cmd_uninstall(deps, args, result):
             if pending is None:
                 pending, outcome = stop_unless_tor_only(deps, unit)
                 result.fields["ln_stopped_first"] = outcome in ("stopped", "disable_failed")
+                unit = pending["unit"] if pending else unit
                 if outcome in ("stop_failed", "disable_failed"):
                     # the tool would start the unit again with that config, or the next boot would start
                     # it without the tunnel: the tool does not run, the dataplane and kill switch stay

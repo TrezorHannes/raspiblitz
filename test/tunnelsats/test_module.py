@@ -1080,6 +1080,7 @@ class TestRemove(ModuleTestCase):
         self.activate_conf(impl="cl")
         self.fake.units["lightningd.service"].update({"ActiveState": "active", "UnitFileState": "enabled",
                                                       "ControlGroup": "/system.slice/lightningd.service"})
+        self.fake.its["verify --no-probe"] = (0, fixture_json("verify", "cln_protected.json"))
         conf = self.write("cln/config", fixture("conf", "cl-config").replace("always-use-proxy=true", ""))
         self.real_audit()
         self.pinned_tool(unit="lightningd.service")
@@ -1286,6 +1287,24 @@ class TestRemove(ModuleTestCase):
                 self.fake.its["uninstall"] = (0, uninstall)
                 doc = self.run_verb("uninstall", "--yes")
                 self.assertEqual((0, [warning], []), (doc["exit_code"], doc["tool_warnings"], doc["warnings"]), doc)
+
+    def test_the_pre_stop_never_touches_a_unit_the_managed_install_does_not_name(self):
+        # state.impl names LND, the managed install is CLN's (verify --no-probe)
+        self.real_audit()
+        self.lnd_conf("listen=0.0.0.0:9735", "listen=0.0.0.0:9735\nexternalip=203.0.113.7")
+        self.write("cln/config", fixture("conf", "cl-config"))
+        self.fake.units["lightningd.service"].update({"ActiveState": "active", "UnitFileState": "enabled",
+                                                      "ControlGroup": "/system.slice/lightningd.service"})
+        self.fake.its["verify --no-probe"] = (0, fixture_json("verify", "cln_protected.json"))
+        self.pinned_tool(unit="lightningd.service")
+        doc = self.run_verb("uninstall", "--yes")
+        f = self.fake
+        self.assertEqual([], [c for c in f.calls if c[0] == "systemctl" and c[-1] == "lnd.service" and c[1] != "show"])
+        self.assertEqual({"ActiveState": "active", "UnitFileState": "enabled"}, self.unit_state())
+        self.assertLess(f.calls.index([mod.ITS, "audit", "lnd", "--json"]), f.calls.index([mod.ITS, "verify", "--no-probe", "--json"]))
+        self.assertEqual((0, True, False, ["active"]), (doc["exit_code"], doc["removed"], doc["ln_stopped_first"], self.tool_found), doc)
+        # LND is the other implementation now: left as it is, with its lines as a warning
+        self.assertIn("lnd.service was left as it is", doc["warnings"][0])
 
     def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
