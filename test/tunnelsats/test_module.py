@@ -1865,13 +1865,16 @@ class TestRepair(ModuleTestCase):
         self.assertEqual((None, []), (doc["ln_start_wait"], self.fake.sleeps))
 
     # -- the check after the reinstall waits until the restarted Lightning unit has started --
-    def reinstall(self, reads, final="active"):
+    def reinstall(self, reads, final="active", substate=None):
         """REPAIR on a node without the managed install: it activates again, and the tool's install
-        restarts LND, which then stays activating for that many reads of its state."""
+        restarts LND, which then stays activating for that many reads of its state (SubState
+        substate while it does)."""
         self.store()
         self.activate_conf()
         self.record()
         self.starts_after_install(reads, final)
+        if substate:
+            self.fake.units["lnd.service"]["SubState"] = substate
         return self.run_verb("repair", "--yes")
 
     def test_the_check_waits_until_lightning_has_started(self):
@@ -1884,7 +1887,8 @@ class TestRepair(ModuleTestCase):
         self.assertNotIn("ln_start", doc["reasons"])
 
     def test_a_start_that_does_not_finish_is_reported_never_passed(self):
-        doc = self.reinstall(1000)
+        # a slow start (SubState start, for example LND waiting for its wallet unlock)
+        doc = self.reinstall(1000, substate="start")
         self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
         self.assertEqual({"unit": "lnd.service", "state": "activating", "waited_s": mod.LN_START_WAIT,
                           "outcome": "timeout"}, doc["ln_start_wait"])
@@ -1893,6 +1897,21 @@ class TestRepair(ModuleTestCase):
         self.assertIn("still starting after %d s" % mod.LN_START_WAIT, check[0]["detail"])
         self.assertIn("ln_start", doc["reasons"])
         self.assertIn(check[0]["detail"], doc["warnings"])
+
+    def test_a_crash_loop_is_reported_as_failed_not_as_a_slow_start(self):
+        # Restart=always, RestartSec=60: after each failed start the unit waits in activating with
+        # SubState auto-restart, so it reads activating for the whole wait
+        doc = self.reinstall(1000, substate="auto-restart")
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual({"unit": "lnd.service", "state": "auto-restart", "waited_s": mod.LN_START_WAIT,
+                          "outcome": "failed"}, doc["ln_start_wait"])
+        check = [c for c in doc["checks"] if c["id"] == "ln_start"]
+        self.assertIn("lnd.service stopped while starting (auto-restart): see journalctl -u lnd.service",
+                      check[0]["detail"])
+        self.assertNotIn("wallet", check[0]["detail"])
+        self.assertIn("ln_start", doc["reasons"])
+        # one read of SubState, only after the wait ended in activating
+        self.assertEqual(1, len([c for c in self.fake.calls if c[:2] == ["systemctl", "show"] and "SubState" in c]))
 
     def test_a_unit_that_fails_while_starting_is_reported(self):
         doc = self.reinstall(2, "failed")

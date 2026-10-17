@@ -1001,8 +1001,9 @@ def wait_until_started(deps, unit, limit=LN_START_WAIT, step=LN_START_STEP):
     """REPAIR and IMPORT, before their final check, after the tool or the module (re)started unit:
     waits while it is "activating" (LND until it is ready, Type=notify), at most limit seconds,
     because verify reports a start in progress as degraded. Returns the record for the result:
-    unit, state (read last), waited_s and outcome: "active", "not_running" (it was not starting),
-    "failed" (it stopped while starting) or "timeout" (still starting at the limit)."""
+    unit, state (read last; "auto-restart" for a unit that keeps failing), waited_s and outcome:
+    "active", "not_running" (it was not starting), "failed" (it stopped while starting, or it waits
+    in auto-restart after a failed start) or "timeout" (still starting at the limit)."""
     started, waited = deps.clock(), 0
     state = unit_props(deps, unit, "ActiveState")["ActiveState"]
     starting = state == "activating"
@@ -1013,7 +1014,12 @@ def wait_until_started(deps, unit, limit=LN_START_WAIT, step=LN_START_STEP):
     if state == "active":
         outcome = "active"
     elif state == "activating":
-        outcome = "timeout"
+        # Restart=always (RestartSec=60): "activating" with SubState auto-restart is the pause after
+        # a start that failed, not a start in progress; one read, only when the wait ends here
+        if unit_props(deps, unit, "SubState")["SubState"] == "auto-restart":
+            outcome, state = "failed", "auto-restart"
+        else:
+            outcome = "timeout"
     else:
         outcome = "failed" if starting else "not_running"
     return {"unit": unit, "state": state or "unknown", "waited_s": waited, "outcome": outcome}
