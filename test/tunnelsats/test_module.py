@@ -1381,6 +1381,36 @@ class TestRemove(ModuleTestCase):
         self.assertEqual([], [c for c in self.fake.calls if c[0] == "systemctl" and c[-1] == "lnd.service"
                               and c[1] != "show"])
 
+    def notice(self):
+        return mod.menu_choices(self.deps, mod.load_state(self.deps), mod.read_rb_conf(self.deps))[1]
+
+    def test_the_menu_after_a_failed_disable_says_the_tunnel_is_removed_and_names_the_command(self):
+        # note 2: REMOVE removed the dataplane, then could not disable LND (config not Tor-only at rest)
+        self.remove_after_a_failed_disable()
+        self.fake.systemctl_rc[("disable", "lnd.service")] = 1
+        self.assertEqual("E_LN_DISABLE", self.run_verb("uninstall", "--yes")["errors"][0]["code"])
+        notice = self.notice()
+        self.assertIn("REMOVE did not finish: the tunnel is already removed", notice)
+        self.assertIn("lnd.service is stopped but still enabled", notice)
+        self.assertIn("Run now: sudo systemctl disable lnd.service", notice)
+        self.assertNotIn("stay in place", notice)
+        self.assertIn("externalhosts=qa.invalid:9735", notice)
+
+    def test_the_menu_after_a_failed_stop_says_the_tunnel_is_removed_and_names_the_command(self):
+        # note 2: the tool started LND again, REMOVE's audit then found the config not Tor-only at rest
+        # (changed after the check before the tool) and LND did not stop
+        self.tool_restarts_lnd()
+        line = "/mnt/hdd/app-data/lnd/lnd.conf:27:tor.skip-proxy-for-clearnet-targets=true"
+        self.fake.its["audit lnd"] = [(0, self.audit("clean")),
+                                      (4, self.audit("drift", None, [line], ["tor.skip-proxy-for-clearnet-targets"]))]
+        self.fake.systemctl_rc[("stop", "lnd.service")] = 1
+        self.assertEqual("E_LN_STOP", self.run_verb("uninstall", "--yes")["errors"][0]["code"])
+        notice = self.notice()
+        self.assertIn("REMOVE did not finish: the tunnel is already removed", notice)
+        self.assertIn("lnd.service still runs (active)", notice)
+        self.assertIn("Run now: sudo systemctl disable --now lnd.service", notice)
+        self.assertIn(line, notice)
+
     def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
         self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))

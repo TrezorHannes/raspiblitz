@@ -1760,11 +1760,12 @@ def at_rest_action(impl, doc, unit, then):
             "lines": lines, "then": then}
 
 
-def keep_pending_removal(deps, unit, doc, reason=None):
+def keep_pending_removal(deps, unit, doc, reason=None, tunnel=None):
     """Records in state.json that a refused or unfinished REMOVE left unit stopped (and disabled,
     per uninstall document doc): the menu then offers REMOVE again instead of START, and the next
     REMOVE enables and starts the unit once the removal is complete and its config is Tor-only at rest.
-    reason: why REMOVE ended with the dataplane still in place (stop_failed, disable_failed), for the menu."""
+    reason: what REMOVE could not do to the unit (stop_failed, disable_failed); tunnel: where the
+    tunnel stood then (in_place, removed, partly_removed). Both for the menu."""
     if not unit or not (doc.get("ln_disabled") or (doc.get("ln_was_active") and not doc.get("ln_started"))):
         return
     state = load_state(deps)
@@ -1773,7 +1774,7 @@ def keep_pending_removal(deps, unit, doc, reason=None):
     state["remove_pending"] = {"unit": unit, "ln_was_active": bool(doc.get("ln_was_active")),
                                "ln_disabled": bool(doc.get("ln_disabled")), "at": now_iso(deps)}
     if reason:
-        state["remove_pending"]["reason"] = reason
+        state["remove_pending"].update({"reason": reason, "tunnel": tunnel or "in_place"})
     save_state(deps, state)
 
 
@@ -1851,7 +1852,7 @@ def stop_unless_tor_only(deps, unit, managed=None):
     systemctl(deps, "stop", unit)
     record["state"] = unit_props(deps, unit, "ActiveState")["ActiveState"] or "unknown"
     if record["state"] not in ("inactive", "failed"):
-        keep_pending_removal(deps, unit, record, reason="stop_failed")
+        keep_pending_removal(deps, unit, record, reason="stop_failed", tunnel="in_place")
         return record, "stop_failed"
     if props["UnitFileState"] not in BOOT_OFF:
         # recorded before the disable: a REMOVE that ends here leaves the next one to enable it again
@@ -1860,7 +1861,7 @@ def stop_unless_tor_only(deps, unit, managed=None):
         systemctl(deps, "disable", unit)
         if unit_props(deps, unit, "UnitFileState")["UnitFileState"] not in BOOT_OFF:
             record["ln_disabled"] = False
-            keep_pending_removal(deps, unit, record, reason="disable_failed")
+            keep_pending_removal(deps, unit, record, reason="disable_failed", tunnel="in_place")
             return record, "disable_failed"
     return record, "stopped"
 
@@ -2032,13 +2033,15 @@ def cmd_uninstall(deps, args, result):
             if "E_LN_STOP" in tool_errors:
                 # the tool removed nothing: the unit did not stop, the tunnel and its kill switch stay
                 state_now = (unit_props(deps, unit, "ActiveState")["ActiveState"] if unit else "") or "unknown"
-                keep_pending_removal(deps, unit, dict(doc, ln_was_active=True, ln_started=False), reason="stop_failed")
+                keep_pending_removal(deps, unit, dict(doc, ln_was_active=True, ln_started=False), reason="stop_failed",
+                                     tunnel="in_place")
                 result.error("E_LN_STOP", "operational",
                              "%s did not stop (state: %s), so the TunnelSats uninstall removed nothing. The tunnel "
                              "and its kill switch stay in place; run REMOVE again" % (unit, state_now), EXIT_OPERATIONAL)
                 return
             # the next REMOVE finds the unit stopped by this one in remove_pending and starts it again
-            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc)
+            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc, reason=problem,
+                                 tunnel="partly_removed")
             left = "removal incomplete: %s; " % ", ".join(result.fields["remaining"])
             if problem:
                 keep_off_error(result, problem, unit, state_now, left)
@@ -2074,7 +2077,8 @@ def cmd_uninstall(deps, args, result):
                 "detail": "; ".join(a["detail"] for a in actions),
                 "lines": [line for a in actions for line in a["lines"]],
                 "then": then}
-            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc)
+            keep_pending_removal(deps, unit, dict(doc, ln_started=False) if problem else doc, reason=problem,
+                                 tunnel="removed")
             if problem:
                 keep_off_error(result, problem, unit, state_now, "; ".join(messages + [""]))
             else:
@@ -2372,18 +2376,31 @@ def menu_choices(deps, state, conf, found=None):
 
 def pending_removal_text(deps, pending):
     """The notice after a REMOVE that did not finish: the live state of the unit it recorded (never the
-    record alone, which is written before the stop), whether the tunnel is still in place (REMOVE
-    stopped before the tool), and a fresh read-only audit of the unit's config."""
+    record alone, which is written before the stop), where the tunnel stands (in place when REMOVE
+    stopped before the tool; removed, or partly removed, when REMOVE could not stop or disable the
+    unit afterwards, with the command to run), and a fresh read-only audit of the unit's config."""
     unit = pending["unit"]
     props = unit_props(deps, unit, "ActiveState", "UnitFileState")
     running = props["ActiveState"] not in ("inactive", "failed")
-    stopped = "stopped and disabled" if props["UnitFileState"] in BOOT_OFF else "stopped"
-    reason = pending.get("reason")
-    if reason in ("stop_failed", "disable_failed"):
+    boot = props["UnitFileState"] not in BOOT_OFF
+    stopped = "stopped and disabled" if not boot else "stopped"
+    reason, tunnel = pending.get("reason"), pending.get("tunnel") or "in_place"
+    what = "did not stop" if reason == "stop_failed" else "could not be disabled"
+    joiner = ": its"
+    if reason in ("stop_failed", "disable_failed") and tunnel != "in_place":
+        now = ("%s still runs (%s)" % (unit, props["ActiveState"] or "state unknown") if running
+               else "%s is stopped but still enabled" % unit if boot else "%s is %s" % (unit, stopped))
+        text = "REMOVE did not finish: the tunnel is %s, and %s %s; %s" % (
+            "already removed" if tunnel == "removed" else "partly removed", unit, what, now)
+        command = ("systemctl disable --now %s" if running and boot else "systemctl stop %s" if running
+                   else "systemctl disable %s" if boot else None)
+        if command:
+            text += ". Run now: sudo %s, so that it neither runs nor starts without the tunnel" % (command % unit)
+            joiner = ". Its"
+    elif reason in ("stop_failed", "disable_failed"):
         now = "%s still runs (%s)" % (unit, props["ActiveState"] or "state unknown") if running \
             else "%s is %s" % (unit, stopped)
-        text = "REMOVE did not finish: %s %s, so the tunnel and its kill switch stay in place; %s" % (
-            unit, "did not stop" if reason == "stop_failed" else "could not be disabled", now)
+        text = "REMOVE did not finish: %s %s, so the tunnel and its kill switch stay in place; %s" % (unit, what, now)
     elif running:
         text = "REMOVE did not finish: %s still runs (%s)" % (unit, props["ActiveState"] or "state unknown")
     else:
@@ -2393,7 +2410,7 @@ def pending_removal_text(deps, pending):
     if audit and audit.get("status") == "clean":
         return text + ". Its config is Tor-only now: choose REMOVE again to finish; %s." % (
             "it enables and starts %s" % unit if not running else "it checks the config first")
-    text += ": its config is not Tor-only at rest"
+    text += joiner + " config is not Tor-only at rest"
     lines = [line for line in (audit or {}).get("lines") or [] if isinstance(line, str)][:8]
     if lines:
         text += ". Remove these lines:\n" + "\n".join("  %s" % line for line in lines)
