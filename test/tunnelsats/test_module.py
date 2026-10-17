@@ -1411,6 +1411,20 @@ class TestRemove(ModuleTestCase):
         self.assertIn("Run now: sudo systemctl disable --now lnd.service", notice)
         self.assertIn(line, notice)
 
+    def test_the_menu_names_no_command_once_the_config_is_tor_only(self):
+        # after a keep_off failure the operator made the config Tor-only: running or starting without
+        # the tunnel is fine now, so the notice asks for REMOVE again, not for a stop or a disable
+        self.remove_after_a_failed_disable()
+        self.fake.systemctl_rc[("disable", "lnd.service")] = 1
+        self.assertEqual("E_LN_DISABLE", self.run_verb("uninstall", "--yes")["errors"][0]["code"])
+        self.fake.its["audit lnd"] = (0, self.audit("clean"))
+        notice = self.notice()
+        self.assertIn("REMOVE did not finish: the tunnel is already removed", notice)
+        self.assertIn("Its config is Tor-only now: choose REMOVE again to finish; it enables and starts "
+                      "lnd.service.", notice)
+        self.assertNotIn("Run now", notice)
+        self.assertNotIn("systemctl", notice)
+
     def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
         self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))

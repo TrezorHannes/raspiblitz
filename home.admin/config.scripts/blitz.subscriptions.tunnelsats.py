@@ -2392,7 +2392,7 @@ def pending_removal_text(deps, pending):
     stopped = "stopped and disabled" if not boot else "stopped"
     reason, tunnel = pending.get("reason"), pending.get("tunnel") or "in_place"
     what = "did not stop" if reason == "stop_failed" else "could not be disabled"
-    joiner = ": its"
+    command = None
     if reason in ("stop_failed", "disable_failed") and tunnel != "in_place":
         now = ("%s still runs (%s)" % (unit, props["ActiveState"] or "state unknown") if running
                else "%s is stopped but still enabled" % unit if boot else "%s is %s" % (unit, stopped))
@@ -2400,9 +2400,6 @@ def pending_removal_text(deps, pending):
             "already removed" if tunnel == "removed" else "partly removed", unit, what, now)
         command = ("systemctl disable --now %s" if running and boot else "systemctl stop %s" if running
                    else "systemctl disable %s" if boot else None)
-        if command:
-            text += ". Run now: sudo %s, so that it neither runs nor starts without the tunnel" % (command % unit)
-            joiner = ". Its"
     elif reason in ("stop_failed", "disable_failed"):
         now = "%s still runs (%s)" % (unit, props["ActiveState"] or "state unknown") if running \
             else "%s is %s" % (unit, stopped)
@@ -2414,9 +2411,14 @@ def pending_removal_text(deps, pending):
     then = "it checks the config first" if running else "it checks the config, then starts %s" % unit
     rc, audit = its(deps, ["audit", IMPL_OF_UNIT[unit], "--json"], timeout=30)
     if audit and audit.get("status") == "clean":
+        # Tor-only now: running or starting without the tunnel is fine, so no stop or disable command
         return text + ". Its config is Tor-only now: choose REMOVE again to finish; %s." % (
             "it enables and starts %s" % unit if not running else "it checks the config first")
-    text += joiner + " config is not Tor-only at rest"
+    if command:
+        text += ". Run now: sudo %s, so that it neither runs nor starts without the tunnel. Its" % (command % unit)
+    else:
+        text += ": its"
+    text += " config is not Tor-only at rest"
     lines = [line for line in (audit or {}).get("lines") or [] if isinstance(line, str)][:8]
     if lines:
         text += ". Remove these lines:\n" + "\n".join("  %s" % line for line in lines)
