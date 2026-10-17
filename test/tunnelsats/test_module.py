@@ -1860,10 +1860,39 @@ class TestAdopt(ModuleTestCase):
         self.fake.its["detect"] = (0, fixture_json("tool", "detect_legacy.json"))
         self.write("etc/wireguard/tunnelsatsv2.conf", fixture("import", "website.conf"))
         self.fake.its["adopt"] = (6, fixture_json("tool", "install_capability.json"))
+        self.fake.its["audit lnd --repair"] = (1, {"contract": 1, "command": "its.audit", "status": "not_checked",
+                                                   "errors": [{"code": "E_UNIT_ACTIVE", "class": "refused",
+                                                               "message": "lnd.service is active"}]})
         doc = self.run_verb("adopt", "--upgrade", "--yes")
         self.assertEqual((3, "E_CAPABILITY_MISSING"), (doc["exit_code"], doc["errors"][0]["code"]), doc)
         self.assertEqual("off", mod.read_rb_conf(self.deps)["tunnelsats"])
         self.assertEqual("adopted_legacy", self.read_json(mod.STATE_FILE)["mode"])
+
+    def test_adopt_upgrade_failure_after_teardown_repairs_at_rest_and_keeps_flag_on(self):
+        self.fake.its["detect"] = (0, fixture_json("tool", "detect_legacy.json"))
+        self.write("etc/wireguard/tunnelsatsv2.conf", fixture("import", "website.conf"))
+        self.fake.its["adopt"] = (1, {"contract": 1, "command": "adopt", "ok": False, "exit_code": 1,
+                                      "errors": [{"code": "E_KILLSWITCH", "class": "operational",
+                                                  "message": "kill switch failed"}]})
+        doc = self.run_verb("adopt", "--upgrade", "--yes")
+        self.assertEqual((1, "E_KILLSWITCH"), (doc["exit_code"], doc["errors"][0]["code"]), doc)
+        self.assertEqual("on", mod.read_rb_conf(self.deps)["tunnelsats"])
+        self.assertIn([mod.ITS, "audit", "lnd", "--repair", "--json"], self.fake.calls)
+        self.assertEqual("adopted_legacy", self.read_json(mod.STATE_FILE)["mode"])
+
+    def test_adopt_upgrade_partial_stores_managed_and_warns(self):
+        self.fake.its["detect"] = (0, fixture_json("tool", "detect_legacy.json"))
+        self.write("etc/wireguard/tunnelsatsv2.conf", fixture("import", "website.conf"))
+        self.record()
+        partial = dict(self.fake.its["adopt"][1])
+        partial.update({"ok": False, "exit_code": 1, "ln_restarted": False,
+                        "errors": [{"code": "E_PARTIAL", "class": "operational",
+                                    "message": "Adopted, but lnd.service did not start"}]})
+        self.fake.its["adopt"] = (1, partial)
+        doc = self.run_verb("adopt", "--upgrade", "--yes")
+        self.assertTrue(doc["adopted"] and doc["upgraded"] and not doc["upgrade_available"])
+        self.assertIn("E_PARTIAL", doc["warnings"])
+        self.assertEqual("managed", self.read_json(mod.STATE_FILE)["mode"])
 
     def test_refusals(self):
         self.assertEqual((2, "E_CONFIRMATION_REQUIRED"), tuple(

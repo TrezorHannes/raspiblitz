@@ -974,10 +974,29 @@ def activate(deps, impl, result, stored_writer=None, tool_verb="install"):
     blitz_conf_set(deps, "tunnelsatsImpl", impl)
     blitz_conf_set(deps, "tunnelsats", "on")
     rc, doc = its(deps, [tool_verb, "--impl", impl, "--json"], timeout=ITS_TIMEOUT[tool_verb])
+    if rc != 0 and tool_verb == "adopt" and doc and doc.get("adopted"):
+        # E_PARTIAL: the managed dataplane is installed and armed, only the Lightning unit or the
+        # verifier timer did not start; finish as managed and let the final check report it
+        result.fields["warnings"] = list(result.fields.get("warnings") or []) + [tool_error(doc, "E_PARTIAL")]
+        rc = 0
     if rc != 0:
-        blitz_conf_set(deps, "tunnelsats", "off")
         fallback = "E_ADOPT_FAILED" if tool_verb == "adopt" else "E_INSTALL_FAILED"
         activation[tool_verb] = tool_error(doc, fallback)
+        if tool_verb == "adopt":
+            # adopt stops Lightning before it removes the legacy setup. Unless the unit still runs (adopt
+            # refused before any change), the legacy clearnet settings may be left without a tunnel:
+            # keep tunnelsats on, so the start guard keeps Lightning Tor-only, and repair them at rest
+            _rc, audit = its(deps, ["audit", impl, "--repair", "--json"], timeout=30)
+            if tool_error(audit, "") != "E_UNIT_ACTIVE":
+                raise ModuleError(activation[tool_verb], "operational",
+                                  "the legacy setup could not be replaced; Lightning stays stopped, and TunnelSats "
+                                  "stays on so its next start is Tor-only (fix the cause, then run ADOPT --upgrade "
+                                  "again)", map_tool_exit(rc))
+            blitz_conf_set(deps, "tunnelsats", "off")
+            raise ModuleError(activation[tool_verb], "operational",
+                              "adopt refused before any change; the legacy setup keeps running (fix the cause, "
+                              "then run ADOPT --upgrade again)", map_tool_exit(rc))
+        blitz_conf_set(deps, "tunnelsats", "off")
         raise ModuleError(activation[tool_verb], "operational",
                           "the managed dataplane could not be installed; Lightning stays Tor-only "
                           "(the stored config stays for REPAIR)", map_tool_exit(rc))
