@@ -91,6 +91,7 @@ class FakeSystem:
             "block-remove": (0, {"state": "absent", "changed": True}),
             "block-status": (0, {"state": "present"}),
             "install": (0, fixture_json("tool", "install_ok.json")),
+            "adopt": (0, fixture_json("tool", "install_ok.json")),
             "uninstall": (0, fixture_json("tool", "uninstall_disabled.json")),
             "verify --no-probe": (5, fixture_json("verify", "activating_tunnel_up.json")),
             "verify": (0, fixture_json("verify", "protected.json")),
@@ -116,7 +117,7 @@ class FakeSystem:
     # -- commands ---------------------------------------------------------------------------
     def its_key(self, args):
         tokens = [a for a in args if a != "--json"]
-        if tokens and tokens[0] in ("install", "guard"):
+        if tokens and tokens[0] in ("install", "adopt", "guard"):
             return tokens[0]
         return " ".join(tokens)
 
@@ -309,7 +310,7 @@ class ModuleTestCase(unittest.TestCase):
         """The tool's install --managed restarts unit, which stays activating (LND until it is ready,
         Type=notify) for that many reads of its ActiveState, then reads back final."""
         def hook(argv):
-            if argv[:2] == [mod.ITS, "install"]:
+            if argv[:2] in ([mod.ITS, "install"], [mod.ITS, "adopt"]):
                 self.fake.units[unit]["ActiveState"] = "activating"
                 self.fake.starting[unit] = [reads, final]
         self.fake.hooks.append(hook)
@@ -725,6 +726,46 @@ class TestImport(ModuleTestCase):
                          doc["ln_start_wait"])
         self.assertEqual([], self.start_steps())
 
+    @staticmethod
+    def verify_no_handshake_yet(extra_fail=None):
+        doc = fixture_json("verify", "protected.json")
+        doc.update({"exit_code": 5, "verdict": "degraded"})
+        for c in doc["checks"]:
+            if c["id"] == "wg_handshake":
+                c.update({"result": "fail", "detail": "no handshake yet"})
+        if extra_fail:
+            doc["checks"].append(extra_fail)
+        return 5, doc
+
+    def test_first_handshake_completing_during_the_probe_wait_gives_protected(self):
+        # Tunnelsats/raspiblitz#5: verify checks wg_handshake before probe_tunnel initiates the
+        # first handshake; when "no handshake yet" is the only failing check, wait briefly and re-check
+        self.record()
+        self.fake.its["verify"] = [self.verify_no_handshake_yet(),
+                                   self.verify_no_handshake_yet(),
+                                   (0, fixture_json("verify", "protected.json"))]
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual((0, "protected"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual([], doc["check"]["reasons"])
+        self.assertEqual([mod.HANDSHAKE_STEP] * 2, self.fake.sleeps)
+
+    def test_no_handshake_at_the_limit_reports_degraded_wg_handshake(self):
+        self.record()
+        self.fake.its["verify"] = self.verify_no_handshake_yet()
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual(["wg_handshake"], doc["check"]["reasons"])
+        self.assertEqual([mod.HANDSHAKE_STEP] * (mod.HANDSHAKE_WAIT // mod.HANDSHAKE_STEP), self.fake.sleeps)
+
+    def test_another_failing_check_does_not_wait_for_handshake(self):
+        self.record()
+        self.fake.its["verify"] = self.verify_no_handshake_yet(
+            {"id": "probe_tunnel", "class": "degraded", "result": "fail", "detail": "probe timed out"})
+        doc = self.run_verb("import", "--file", self.import_file)
+        self.assertEqual((5, "degraded"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertEqual(["wg_handshake", "probe_tunnel"], doc["check"]["reasons"])
+        self.assertEqual([], self.fake.sleeps)
+
 
 # ------------------------------------------------------------------------------------------
 # REMOVE, ADOPT, REPAIR
@@ -778,6 +819,7 @@ class TestRunCommand(unittest.TestCase):
         self.assertGreater(t["fetch"], budget + 10)
         self.assertGreater(t["detect"], budget + 10 + tool("detect") + 10)
         self.assertGreater(t["install"], tool("install") + 10)
+        self.assertGreater(t["adopt"], tool("adopt") + 10)
         self.assertGreater(t["uninstall"], tool("uninstall") + 10)
         self.assertGreater(t["verify"], 120 + 10)
         self.assertGreater(t["verify_no_probe"], 35 + 10)
@@ -1755,6 +1797,11 @@ class TestMenu(ModuleTestCase):
         choices, notice = mod.menu_choices(self.deps, None, mod.read_rb_conf(self.deps), {"adopt_available": True})
         self.assertEqual((["IMPORT", "ADOPT", "ABOUT"], None), ([tag for tag, _text in choices], notice))
 
+    def test_adopted_legacy_offers_upgrade(self):
+        shutil.rmtree(self.path(mod.STATE_DIR))
+        self.store(mode="adopted_legacy")
+        self.assertEqual(["STATUS", "CHECK", "UPGRADE", "REPAIR", "REMOVE"], self.tags())
+
 
 class TestAdopt(ModuleTestCase):
     def snapshot(self):
@@ -1781,7 +1828,7 @@ class TestAdopt(ModuleTestCase):
         self.assertTrue(doc["adopted"])
         self.assertEqual("legacy_v3_post_204", doc["legacy_kind"])
         self.assertEqual([2, 6], [entry["line"] for entry in doc["custom_installs_lines"]])
-        self.assertFalse(doc["upgrade_available"])
+        self.assertTrue(doc["upgrade_available"])
         self.assertEqual(before, self.snapshot())
         self.assertEqual([], [c for c in self.fake.calls if c[0] in (mod.BLITZ_CONF, "systemctl")])
         self.assertEqual([[mod.ITS, "detect", "--json"]], self.fake.calls_of(mod.ITS))
@@ -1789,8 +1836,39 @@ class TestAdopt(ModuleTestCase):
         self.assertNotIn(b"PostUp", self.read_bytes(mod.CONF_FILE))
         self.assertEqual("unsafe", self.run_verb("check")["verdict"])
 
+    def test_adopt_upgrade_converts_legacy_or_adopted_legacy_to_managed(self):
+        self.fake.its["detect"] = (0, fixture_json("tool", "detect_legacy.json"))
+        legacy = fixture("import", "website.conf").replace("DNS = 8.8.8.8", "DNS = 8.8.8.8\nPostUp = /etc/wireguard/tunnelsats-route-guard.sh")
+        self.write("etc/wireguard/tunnelsatsv2.conf", legacy)
+        self.record()
+        doc = self.run_verb("adopt", "--upgrade", "--yes")
+        self.assertEqual((0, "protected"), (doc["exit_code"], doc["verdict"]), doc)
+        self.assertTrue(doc["adopted"] and doc["upgraded"] and not doc["upgrade_available"])
+        self.assertEqual("legacy_v3_post_204", doc["legacy_kind"])
+        self.assertEqual("managed", self.read_json(mod.STATE_FILE)["mode"])
+        self.assertIn([mod.ITS, "adopt", "--impl", "lnd", "--json"], self.fake.calls)
+        # two-step: adopt first, then adopt --upgrade --yes reuses the stored config
+        shutil.rmtree(self.path(mod.STATE_DIR))
+        self.fake.calls.clear()
+        self.run_verb("adopt")
+        os.unlink(self.path("etc/wireguard/tunnelsatsv2.conf"))
+        doc2 = self.run_verb("adopt", "--upgrade", "--yes")
+        self.assertEqual((0, "protected", True), (doc2["exit_code"], doc2["verdict"], doc2["upgraded"]), doc2)
+        self.assertEqual("managed", self.read_json(mod.STATE_FILE)["mode"])
+
+    def test_adopt_upgrade_failure_rolls_back_flag_and_keeps_adopted_legacy(self):
+        self.fake.its["detect"] = (0, fixture_json("tool", "detect_legacy.json"))
+        self.write("etc/wireguard/tunnelsatsv2.conf", fixture("import", "website.conf"))
+        self.fake.its["adopt"] = (6, fixture_json("tool", "install_capability.json"))
+        doc = self.run_verb("adopt", "--upgrade", "--yes")
+        self.assertEqual((3, "E_CAPABILITY_MISSING"), (doc["exit_code"], doc["errors"][0]["code"]), doc)
+        self.assertEqual("off", mod.read_rb_conf(self.deps)["tunnelsats"])
+        self.assertEqual("adopted_legacy", self.read_json(mod.STATE_FILE)["mode"])
+
     def test_refusals(self):
-        self.assertEqual((14, "E_UPGRADE_UNAVAILABLE"), tuple(
+        self.assertEqual((2, "E_CONFIRMATION_REQUIRED"), tuple(
+            (d["exit_code"], d["errors"][0]["code"]) for d in [self.run_verb("adopt", "--upgrade")])[0])
+        self.assertEqual((3, "E_NOTHING_TO_ADOPT"), tuple(
             (d["exit_code"], d["errors"][0]["code"]) for d in [self.run_verb("adopt", "--upgrade", "--yes")])[0])
         self.assertEqual(3, self.run_verb("adopt")["exit_code"])
         self.fake.its["detect"] = (0, fixture_json("tool", "detect_managed.json"))
@@ -1899,6 +1977,17 @@ class TestRepair(ModuleTestCase):
                          doc["ln_start_wait"])
         self.assertEqual([mod.LN_START_STEP] * 2, self.start_steps())
         self.assertNotIn("ln_start", doc["reasons"])
+
+    def test_first_handshake_completing_after_reinstall_gives_protected(self):
+        # Tunnelsats/raspiblitz#5: REPAIR reinstall waits for the handshake probe_tunnel initiated
+        self.store()
+        self.activate_conf()
+        self.record()
+        self.fake.its["verify"] = [TestImport.verify_no_handshake_yet(),
+                                   (0, fixture_json("verify", "protected.json"))]
+        doc = self.run_verb("repair", "--yes")
+        self.assertEqual((0, "protected", []), (doc["exit_code"], doc["verdict"], doc["reasons"]), doc)
+        self.assertEqual([mod.HANDSHAKE_STEP], self.fake.sleeps)
 
     def test_a_start_that_does_not_finish_is_reported_never_passed(self):
         # a slow start (SubState start, for example LND waiting for its wallet unlock)
