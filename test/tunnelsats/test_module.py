@@ -1359,6 +1359,28 @@ class TestRemove(ModuleTestCase):
         # LND is the other implementation now: left as it is, with its lines as a warning
         self.assertIn("lnd.service was left as it is", doc["warnings"][0])
 
+    # -- issue 3 -----------------------------------------------------------------------------
+    def test_the_pre_stop_finds_the_managed_unit_through_its_drop_in(self):
+        # note 1: state.impl names LND, which is stopped; the managed install is CLN's, and detect
+        # names its drop-in (no extra call). CLN runs with a config that is not Tor-only at rest.
+        self.fake.its["detect"] = [(0, fixture_json("tool", "detect_managed_cln.json")),
+                                   (0, fixture_json("tool", "detect_none.json"))]
+        self.fake.units["lnd.service"].update({"ActiveState": "inactive", "MainPID": "0", "ControlGroup": ""})
+        self.fake.units["lightningd.service"].update({"ActiveState": "active", "UnitFileState": "enabled",
+                                                      "ControlGroup": "/system.slice/lightningd.service"})
+        conf = self.write("cln/config", fixture("conf", "cl-config").replace("always-use-proxy=true", ""))
+        self.real_audit()
+        self.pinned_tool(unit="lightningd.service")
+        self.watch_the_stop(unit="lightningd.service")
+        doc = self.run_verb("uninstall", "--yes")
+        self.assert_stopped_before_the_tool(doc, unit="lightningd.service")
+        self.assert_repaired_and_started(doc, unit="lightningd.service")
+        with open(conf) as handle:
+            self.assertIn("always-use-proxy=true", handle.read())
+        self.assertEqual([], self.fake.calls_of(mod.ITS, "verify"))
+        self.assertEqual([], [c for c in self.fake.calls if c[0] == "systemctl" and c[-1] == "lnd.service"
+                              and c[1] != "show"])
+
     def test_the_other_implementation_is_reported_as_a_warning_and_never_edited(self):
         line = "/home/bitcoin/.lightning/config:7:bind-addr=0.0.0.0:9735"
         self.fake.its["audit cl"] = (4, self.audit("drift", None, [line], ["bind-addr"]))

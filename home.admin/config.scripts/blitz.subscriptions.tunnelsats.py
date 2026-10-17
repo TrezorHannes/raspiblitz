@@ -115,6 +115,9 @@ ADDRESS_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b")
 # degraded): at most LN_START_WAIT seconds, read every LN_START_STEP seconds
 LN_START_WAIT = 90
 LN_START_STEP = 3
+# the drop-in with which install --managed puts the managed unit into the slice, as detect reports it
+# (artifact managed_ln_dropin)
+DROPIN_RE = re.compile(r"/etc/systemd/system/([A-Za-z0-9_.@-]+\.service)\.d/tunnelsats-managed\.conf")
 
 # Validators, always applied with fullmatch: with match, a "$" would also accept a final newline
 KEY_RE = re.compile(r"[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=")
@@ -1801,7 +1804,19 @@ def managed_unit(deps):
     return unit if unit in UNITS.values() else None
 
 
-def stop_unless_tor_only(deps, unit):
+def dropin_unit(found):
+    """The Lightning unit of the managed install as the detect document found names it: the one unit
+    whose drop-in from install --managed is present (artifact managed_ln_dropin). None when there is
+    no such drop-in, more than one, or one for a unit RaspiBlitz does not tunnel."""
+    units = set()
+    for art in ((found or {}).get("install") or {}).get("artifacts") or []:
+        if isinstance(art, dict) and art.get("id") == "managed_ln_dropin" and art.get("status") == "present":
+            match = DROPIN_RE.fullmatch(str(art.get("location") or ""))
+            units.add(match.group(1) if match else None)
+    return units.pop() if len(units) == 1 and units <= set(UNITS.values()) else None
+
+
+def stop_unless_tor_only(deps, unit, managed=None):
     """REMOVE, before uninstall --managed. Since tunnelsats PR 227 the tool starts the unit it stopped
     again itself when its own check of the node config finds no TunnelSats clearnet settings. That
     check is narrower than the at-rest audit (for LND it leaves out externalip, an empty externalhosts
@@ -1811,20 +1826,23 @@ def stop_unless_tor_only(deps, unit):
     therefore stopped here while the dataplane still holds, recorded as remove_pending before the
     stop, and disabled. The tool then neither stops nor starts it, and this REMOVE repairs the config
     and enables and starts the unit after its own audit, or keeps it stopped and disabled, as after a
-    refused REMOVE. A unit verify names as not the managed one is never touched. Returns (record or
-    None, outcome): "skipped", "stopped", or, when the tool must not run, "stop_failed" (the record
-    has the state read back in "state") or "disable_failed" (still enabled: without the dataplane
-    the next boot would start it with that config)."""
+    refused REMOVE. managed: the managed unit as detect names it (dropin_unit), used as it is, also
+    when state.impl names another, stopped unit; without it, verify --no-probe is asked once a stop is
+    due, and a unit it names as not the managed one is never touched. Returns (record or None,
+    outcome): "skipped", "stopped", or, when the tool must not run, "stop_failed" (the record has the
+    state read back in "state") or "disable_failed" (still enabled: without the dataplane the next
+    boot would start it with that config)."""
+    unit = managed or unit
     impl = IMPL_OF_UNIT.get(unit) if unit else None
     if impl is None:
         return None, "skipped"
     props = unit_props(deps, unit, "ActiveState", "UnitFileState")
     if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
         return None, "skipped"
-    managed = managed_unit(deps)
-    if managed and managed != unit:
+    found = None if managed else managed_unit(deps)
+    if found and found != unit:
         # state.impl does not name the managed install: only its unit is stopped, never another one
-        unit, impl = managed, IMPL_OF_UNIT[managed]
+        unit, impl = found, IMPL_OF_UNIT[found]
         props = unit_props(deps, unit, "ActiveState", "UnitFileState")
         if props["ActiveState"] in ("inactive", "failed") or at_rest_ok(at_rest_audit(deps, impl, repair=False)):
             return None, "skipped"
@@ -1924,10 +1942,14 @@ def cmd_uninstall(deps, args, result):
         notes = []
         result.fields["warnings"] = notes
         if managed:
+            # the unit of the managed install: detect names its drop-in (no extra call), which also
+            # holds when state.impl names the other implementation; else the stored implementation's
+            dropin = dropin_unit(tool)
+            unit = dropin or unit
             # an earlier REMOVE that did not finish may have stopped the unit (read while it is stopped)
             pending = pending_removal(deps, state)
             if pending is None:
-                pending, outcome = stop_unless_tor_only(deps, unit)
+                pending, outcome = stop_unless_tor_only(deps, unit, managed=dropin)
                 result.fields["ln_stopped_first"] = outcome in ("stopped", "disable_failed")
                 unit = pending["unit"] if pending else unit
                 if outcome in ("stop_failed", "disable_failed"):
